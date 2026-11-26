@@ -312,8 +312,13 @@ pub(crate) fn storage_formula(formula: &str) -> String {
                 unit_start.push(opener);
                 completes_unit = true;
             }
-            (TokenType::Operand, _) => {
-                pieces.push(text.to_string());
+            (TokenType::Operand, subtype) => {
+                let piece = if subtype == TokenSubType::Range {
+                    storage_structured_reference(text)
+                } else {
+                    text.to_string()
+                };
+                pieces.push(piece);
                 unit_start.push(index);
                 completes_unit = true;
             }
@@ -361,6 +366,68 @@ pub(crate) fn storage_formula(formula: &str) -> String {
             .map(str::to_string)
             .unwrap_or(rewritten)
     }
+}
+
+/// A structured reference as Excel stores it: the `@` this-row shorthand is
+/// UI syntax only, so `T[@]`, `T[@Col]`, `T[@[Col]]` and the engine's
+/// canonical `T[[@],[Col]]` become `T[#This Row]` / `T[[#This Row],[Col]]`.
+/// A reference without `[@` is returned unchanged.
+fn storage_structured_reference(text: &str) -> String {
+    const THIS_ROW: &str = "#This Row";
+    if !text.contains("[@") {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len() + 16);
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\'' {
+            // `'` escapes the next character of a column name.
+            out.push(c);
+            if let Some(&next) = chars.get(i + 1) {
+                out.push(next);
+            }
+            i += 2;
+            continue;
+        }
+        if c == '[' && chars.get(i + 1) == Some(&'@') {
+            match chars.get(i + 2) {
+                // `[@]`
+                Some(']') => {
+                    out.push_str(&format!("[{THIS_ROW}]"));
+                    i += 3;
+                }
+                // `[@[Col]…]`: the bracketed columns follow the item.
+                Some('[') => {
+                    out.push_str(&format!("[[{THIS_ROW}],"));
+                    i += 2;
+                }
+                // `[@Col]`: a bare column name up to the unescaped `]`.
+                _ => {
+                    let mut j = i + 2;
+                    let mut column = String::new();
+                    while j < chars.len() && chars[j] != ']' {
+                        if chars[j] == '\'' && j + 1 < chars.len() {
+                            column.push(chars[j]);
+                            j += 1;
+                        }
+                        column.push(chars[j]);
+                        j += 1;
+                    }
+                    if j >= chars.len() {
+                        return text.to_string();
+                    }
+                    out.push_str(&format!("[[{THIS_ROW}],[{column}]]"));
+                    i = j + 1;
+                }
+            }
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
 }
 
 /// A1-style cell reference (1-based).
@@ -526,7 +593,6 @@ pub(crate) fn write_dynamic_arrays(
     bytes: &[u8],
     anchors: &[DynamicArrayAnchor],
 ) -> io::Result<Vec<u8>> {
-    use zip::write::SimpleFileOptions;
     if anchors.is_empty() {
         return Ok(bytes.to_vec());
     }
@@ -582,42 +648,331 @@ pub(crate) fn write_dynamic_arrays(
         ),
     )?;
     replaced.insert(CONTENT_TYPES.to_string(), types.into_bytes());
-
-    let mut out = Vec::with_capacity(bytes.len() + 2048);
-    {
-        let mut writer = zip::ZipWriter::new(Cursor::new(&mut out));
-        for i in 0..archive.len() {
-            let entry = archive.by_index(i).map_err(io::Error::other)?;
-            let name = entry.name().map_err(io::Error::other)?.into_owned();
-            match replaced.remove(&name) {
-                Some(data) => {
-                    let options = SimpleFileOptions::default()
-                        .compression_method(entry.compression())
-                        .last_modified_time(entry.last_modified().unwrap_or_default());
-                    drop(entry);
-                    writer.start_file(name, options).map_err(io::Error::other)?;
-                    writer.write_all(&data)?;
-                }
-                None => writer.raw_copy_file(entry).map_err(io::Error::other)?,
-            }
-        }
-        writer
-            .start_file(
-                METADATA_PART,
-                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated),
-            )
-            .map_err(io::Error::other)?;
-        writer.write_all(METADATA_XML.as_bytes())?;
-        writer.finish().map_err(io::Error::other)?;
-    }
-    if !replaced.is_empty() {
-        return Err(invalid("dynamic array export lost a rewritten part"));
-    }
-    Ok(out)
+    replaced.insert(METADATA_PART.to_string(), METADATA_XML.as_bytes().to_vec());
+    rewrite_archive(&mut archive, replaced, bytes.len())
 }
 
 fn archive_has(read: &mut impl FnMut(&str) -> io::Result<Vec<u8>>, name: &str) -> bool {
     read(name).is_ok()
+}
+
+/// Copy `archive`, replacing the entries named in `parts` and appending the
+/// remaining `parts` as new deflated entries (in name order).
+fn rewrite_archive(
+    archive: &mut zip::ZipArchive<Cursor<&[u8]>>,
+    mut parts: HashMap<String, Vec<u8>>,
+    size_hint: usize,
+) -> io::Result<Vec<u8>> {
+    use zip::write::SimpleFileOptions;
+    let mut out = Vec::with_capacity(size_hint + 4096);
+    let mut writer = zip::ZipWriter::new(Cursor::new(&mut out));
+    for i in 0..archive.len() {
+        let entry = archive.by_index(i).map_err(io::Error::other)?;
+        let name = entry.name().map_err(io::Error::other)?.into_owned();
+        match parts.remove(&name) {
+            Some(data) => {
+                let options = SimpleFileOptions::default()
+                    .compression_method(entry.compression())
+                    .last_modified_time(entry.last_modified().unwrap_or_default());
+                drop(entry);
+                writer.start_file(name, options).map_err(io::Error::other)?;
+                writer.write_all(&data)?;
+            }
+            None => writer.raw_copy_file(entry).map_err(io::Error::other)?,
+        }
+    }
+    let added: BTreeMap<String, Vec<u8>> = parts.into_iter().collect();
+    for (name, data) in added {
+        writer
+            .start_file(
+                name,
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated),
+            )
+            .map_err(io::Error::other)?;
+        writer.write_all(&data)?;
+    }
+    writer.finish().map_err(io::Error::other)?;
+    Ok(out)
+}
+
+/// A defined name to write into `xl/workbook.xml`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DefinedNameExport {
+    pub name: String,
+    /// Zero-based index of the scope sheet in workbook order; `None` for
+    /// workbook scope.
+    pub local_sheet: Option<usize>,
+    /// Formula text without a leading `=`, in storage form.
+    pub formula: String,
+}
+
+/// A table (ListObject) to write as an `xl/tables/tableN.xml` part.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TableExport {
+    pub sheet: String,
+    pub name: String,
+    /// Full extent (1-based, inclusive), including header and totals rows.
+    pub first_row: u32,
+    pub first_col: u32,
+    pub last_row: u32,
+    pub last_col: u32,
+    pub header_row: bool,
+    pub totals_row: bool,
+    pub headers: Vec<String>,
+}
+
+const TABLE_RELATIONSHIP: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/table";
+const TABLE_CONTENT_TYPE: &str =
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml";
+const RELATIONSHIPS_NS: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+const PACKAGE_RELATIONSHIPS_NS: &str =
+    "http://schemas.openxmlformats.org/package/2006/relationships";
+const SHEET_MAIN_NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+
+fn escape_xml(text: &str) -> String {
+    quick_xml::escape::escape(text).into_owned()
+}
+
+/// The `<definedNames>` children for `names`.
+fn defined_names_xml(names: &[DefinedNameExport]) -> String {
+    let mut out = String::new();
+    for name in names {
+        out.push_str("<definedName name=\"");
+        out.push_str(&escape_xml(&name.name));
+        out.push('"');
+        if let Some(sheet) = name.local_sheet {
+            out.push_str(&format!(" localSheetId=\"{sheet}\""));
+        }
+        out.push('>');
+        out.push_str(&quick_xml::escape::partial_escape(&name.formula));
+        out.push_str("</definedName>");
+    }
+    out
+}
+
+/// Add `names` to a workbook part: into an existing `<definedNames>`, or as
+/// a new one directly after `</sheets>` (its place in `CT_Workbook`, since
+/// Umya writes no `functionGroups` or `externalReferences`).
+fn add_defined_names(workbook: &str, names: &[DefinedNameExport]) -> io::Result<String> {
+    let entries = defined_names_xml(names);
+    if workbook.contains("</definedNames>") {
+        return insert_before_close(workbook, "definedNames", &entries);
+    }
+    let fragment = format!("<definedNames>{entries}</definedNames>");
+    if let Some(at) = workbook.find("</sheets>") {
+        let at = at + "</sheets>".len();
+        return Ok(format!("{}{fragment}{}", &workbook[..at], &workbook[at..]));
+    }
+    Err(invalid("workbook part has no </sheets>"))
+}
+
+/// A1 range text for an inclusive 1-based rectangle.
+fn a1_range(first_row: u32, first_col: u32, last_row: u32, last_col: u32) -> String {
+    format!("{}:{}", a1(first_row, first_col), a1(last_row, last_col))
+}
+
+/// The `xl/tables/tableN.xml` part for `table`.
+fn table_xml(table: &TableExport, id: u32) -> String {
+    let reference = a1_range(
+        table.first_row,
+        table.first_col,
+        table.last_row,
+        table.last_col,
+    );
+    let name = escape_xml(&table.name);
+    let mut out = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n");
+    out.push_str(&format!(
+        "<table xmlns=\"{SHEET_MAIN_NS}\" id=\"{id}\" name=\"{name}\" displayName=\"{name}\" ref=\"{reference}\""
+    ));
+    if !table.header_row {
+        out.push_str(" headerRowCount=\"0\"");
+    }
+    if table.totals_row {
+        // Umya's reader takes the totals row from `totalsRowShown`, so state
+        // the spec default explicitly.
+        out.push_str(" totalsRowCount=\"1\" totalsRowShown=\"1\"");
+    } else {
+        out.push_str(" totalsRowShown=\"0\"");
+    }
+    out.push('>');
+    if table.header_row {
+        // The filter covers the header and data rows, never the totals row.
+        let last = table.last_row - u32::from(table.totals_row);
+        out.push_str(&format!(
+            "<autoFilter ref=\"{}\"/>",
+            a1_range(table.first_row, table.first_col, last, table.last_col)
+        ));
+    }
+    out.push_str(&format!("<tableColumns count=\"{}\">", table.headers.len()));
+    for (i, header) in table.headers.iter().enumerate() {
+        out.push_str(&format!(
+            "<tableColumn id=\"{}\" name=\"{}\"/>",
+            i + 1,
+            escape_xml(header)
+        ));
+    }
+    out.push_str("</tableColumns>");
+    out.push_str(
+        "<tableStyleInfo name=\"TableStyleMedium2\" showFirstColumn=\"0\" \
+         showLastColumn=\"0\" showRowStripes=\"1\" showColumnStripes=\"0\"/>",
+    );
+    out.push_str("</table>");
+    out
+}
+
+/// The relationships part of a package part (`xl/worksheets/sheet1.xml` →
+/// `xl/worksheets/_rels/sheet1.xml.rels`).
+fn rels_part_for(part: &str) -> String {
+    match part.rsplit_once('/') {
+        Some((dir, file)) => format!("{dir}/_rels/{file}.rels"),
+        None => format!("_rels/{part}.rels"),
+    }
+}
+
+/// Add `<tableParts>` referencing `ids` to a worksheet part. It goes after
+/// every other child but a trailing worksheet `<extLst>`.
+fn add_table_parts(sheet: &str, ids: &[String]) -> io::Result<String> {
+    if sheet.contains("<tableParts") {
+        return Err(invalid("worksheet already has table parts"));
+    }
+    let root_end = sheet
+        .find("<worksheet")
+        .and_then(|at| sheet[at..].find('>').map(|end| at + end))
+        .ok_or_else(|| invalid("worksheet part has no root"))?;
+    // Declare `r:` locally when the root does not.
+    let declare = if sheet[..root_end].contains(&format!("xmlns:r=\"{RELATIONSHIPS_NS}\"")) {
+        String::new()
+    } else {
+        format!(" xmlns:r=\"{RELATIONSHIPS_NS}\"")
+    };
+    let mut fragment = format!("<tableParts count=\"{}\"{declare}>", ids.len());
+    for id in ids {
+        fragment.push_str(&format!("<tablePart r:id=\"{id}\"/>"));
+    }
+    fragment.push_str("</tableParts>");
+    let sheet_data_end = sheet.find("</sheetData>").unwrap_or(0);
+    match sheet.rfind("<extLst") {
+        Some(at) if at > sheet_data_end => {
+            Ok(format!("{}{fragment}{}", &sheet[..at], &sheet[at..]))
+        }
+        _ => insert_before_close(sheet, "worksheet", &fragment),
+    }
+}
+
+/// The largest `N` among entries named `{prefix}N{suffix}`.
+fn max_numbered_part(archive: &zip::ZipArchive<Cursor<&[u8]>>, prefix: &str, suffix: &str) -> u32 {
+    archive
+        .file_names()
+        .filter_map(|name| {
+            name.ok()?
+                .strip_prefix(prefix)?
+                .strip_suffix(suffix)?
+                .parse()
+                .ok()
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// Rewrite a package saved by Umya so it carries the engine's defined names
+/// (`<definedNames>` in `xl/workbook.xml`) and tables (`xl/tables/tableN.xml`
+/// parts, each referenced from its worksheet's `<tableParts>` and `.rels`
+/// and given a content-type override). Table formulas stay ordinary cell
+/// formulas; Excel does not need `calculatedColumnFormula` to open them.
+pub(crate) fn write_names_and_tables(
+    bytes: &[u8],
+    names: &[DefinedNameExport],
+    tables: &[TableExport],
+) -> io::Result<Vec<u8>> {
+    if names.is_empty() && tables.is_empty() {
+        return Ok(bytes.to_vec());
+    }
+    let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).map_err(io::Error::other)?;
+    let read =
+        |archive: &mut zip::ZipArchive<Cursor<&[u8]>>, name: &str| -> io::Result<Option<String>> {
+            let mut entry = match archive.by_name(name) {
+                Ok(entry) => entry,
+                Err(zip::result::ZipError::FileNotFound) => return Ok(None),
+                Err(e) => return Err(io::Error::other(e)),
+            };
+            let mut out = String::new();
+            entry.read_to_string(&mut out)?;
+            Ok(Some(out))
+        };
+    let required = |part: Option<String>, name: &str| {
+        part.ok_or_else(|| invalid(format!("package has no {name}")))
+    };
+    let mut parts: HashMap<String, Vec<u8>> = HashMap::new();
+    let workbook = required(read(&mut archive, WORKBOOK)?, WORKBOOK)?;
+
+    if !tables.is_empty() {
+        let rels = required(read(&mut archive, WORKBOOK_RELS)?, WORKBOOK_RELS)?;
+        let sheet_parts = sheet_parts(workbook.as_bytes(), rels.as_bytes())?;
+        let mut types = required(read(&mut archive, CONTENT_TYPES)?, CONTENT_TYPES)?;
+        let first = max_numbered_part(&archive, "xl/tables/table", ".xml") + 1;
+        let mut by_part: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+        let mut sheet_rels: HashMap<String, String> = HashMap::new();
+        let mut type_overrides = String::new();
+        for (next, table) in (first..).zip(tables) {
+            let part = sheet_parts
+                .get(&table.sheet)
+                .ok_or_else(|| invalid(format!("no worksheet part for '{}'", table.sheet)))?;
+            let rels_part = rels_part_for(part);
+            let rels_xml = match sheet_rels.get(&rels_part) {
+                Some(xml) => xml.clone(),
+                None => read(&mut archive, &rels_part)?.unwrap_or_else(|| {
+                    format!(
+                        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+                         <Relationships xmlns=\"{PACKAGE_RELATIONSHIPS_NS}\"></Relationships>"
+                    )
+                }),
+            };
+            let rid = fresh_relationship_id(&rels_xml);
+            let rels_xml = insert_before_close(
+                &rels_xml,
+                "Relationships",
+                &format!(
+                    "<Relationship Id=\"{rid}\" Type=\"{TABLE_RELATIONSHIP}\" Target=\"../tables/table{next}.xml\"/>"
+                ),
+            )?;
+            sheet_rels.insert(rels_part, rels_xml);
+            by_part.entry(part.as_str()).or_default().push(rid);
+            parts.insert(
+                format!("xl/tables/table{next}.xml"),
+                table_xml(table, next).into_bytes(),
+            );
+            type_overrides.push_str(&format!(
+                "<Override PartName=\"/xl/tables/table{next}.xml\" ContentType=\"{TABLE_CONTENT_TYPE}\"/>"
+            ));
+        }
+        for (part, ids) in by_part {
+            let sheet = required(read(&mut archive, part)?, part)?;
+            parts.insert(
+                part.to_string(),
+                add_table_parts(&sheet, &ids)?.into_bytes(),
+            );
+        }
+        for (part, xml) in sheet_rels {
+            parts.insert(part, xml.into_bytes());
+        }
+        if !types.contains("Extension=\"rels\"") {
+            type_overrides.push_str(
+                "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>",
+            );
+        }
+        types = insert_before_close(&types, "Types", &type_overrides)?;
+        parts.insert(CONTENT_TYPES.to_string(), types.into_bytes());
+    }
+
+    if !names.is_empty() {
+        parts.insert(
+            WORKBOOK.to_string(),
+            add_defined_names(&workbook, names)?.into_bytes(),
+        );
+    }
+    rewrite_archive(&mut archive, parts, bytes.len())
 }
 
 #[cfg(test)]
@@ -646,7 +1001,20 @@ mod tests {
             ("=@A1:A3", "=_xlfn.SINGLE(A1:A3)"),
             ("=@A1#", "=_xlfn.SINGLE(_xlfn.ANCHORARRAY(A1))"),
             ("=@INDEX(A:A, 2) + 1", "=_xlfn.SINGLE(INDEX(A:A, 2)) + 1"),
-            ("=Table1[@Col] + 1", "=Table1[@Col] + 1"),
+            ("=Table1[@Col] + 1", "=Table1[[#This Row],[Col]] + 1"),
+            (
+                "=Sales[[@],[Qty]] * Sales[[@],[Unit Price]]",
+                "=Sales[[#This Row],[Qty]] * Sales[[#This Row],[Unit Price]]",
+            ),
+            ("=Sales[@[Unit Price]]", "=Sales[[#This Row],[Unit Price]]"),
+            (
+                "=SUM(Sales[@[Qty]:[Total]])",
+                "=SUM(Sales[[#This Row],[Qty]:[Total]])",
+            ),
+            ("=Sales[@]", "=Sales[#This Row]"),
+            ("=Sales[@'[x']]", "=Sales[[#This Row],['[x']]]"),
+            ("=Sales[[#Totals],[Total]]", "=Sales[[#Totals],[Total]]"),
+            ("=\"[@x]\"", "=\"[@x]\""),
             ("=A1 * 10%", "=A1 * 10%"),
             ("SEQUENCE(3)", "_xlfn.SEQUENCE(3)"),
         ] {
