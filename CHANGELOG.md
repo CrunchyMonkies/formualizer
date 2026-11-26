@@ -7,6 +7,7 @@ All notable changes to Formualizer will be documented in this file.
 ### Fixed
 
 - Loading an `.xlsx` file with the default native reader now registers its worksheet tables with the engine, so structured references such as `SUM(Sales[Total])`, `Sales[#All]` and `Sales[#Headers]` evaluate instead of returning `#NAME?`. A table part the reader cannot read is skipped rather than refusing the workbook. (#571)
+- Structured references that Excel writes for calculated columns and totals now evaluate instead of returning `#N/IMPL!`: this-row references (`Table1[[#This Row],[Qty]]`, `Table1[@Qty]`, `Table1[@[Unit Price]]`, `Table1[@[Qty]:[Unit Price]]`), which read the formula cell's own row and are `#VALUE!` outside the table's data rows; section and column combinations (`Table1[[#Totals],[Total]]`, `Table1[[#Headers],[#Data],[Qty]]`, `Table1[[#Data],[#Totals],[Qty]]`); unqualified references inside a table (`[[#Totals],[Qty]]`); and a bare table name (`SUM(Table1)`), which means its data body. A calculated column depends only on its own row's cells, so editing one input recomputes one row. `Table1[@[Qty]:[Unit Price]]` now parses as a this-row column span, and column names containing `[`, `]`, `#` or `'` print with Excel's `'` escape.
 
 ## [0.15.0] - 2026-11-21
 

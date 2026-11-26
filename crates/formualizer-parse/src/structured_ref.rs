@@ -521,8 +521,30 @@ fn parse_at_shorthand(rest: &str) -> Result<TableSpecifier, ParsingError> {
             crate::parser::TableRowSpecifier::Current,
         ));
     }
-    // Strip an optional surrounding `[ ... ]` to support `@[Col Name]`.
     let trimmed = rest.trim();
+    // `@[Col1]:[Col2]` selects a span of columns in the current row. A
+    // bracketed start that is not one outer bracket pair can only be that
+    // span, so parse it with the ordinary item grammar.
+    if trimmed.starts_with('[') && strip_outer_brackets(trimmed).is_none() {
+        let mut p = ItemParser::new(trimmed);
+        let item = p.parse_item()?;
+        p.skip_ws();
+        if !p.eof() {
+            return Err(ParsingError::InvalidReference(format!(
+                "Unexpected content after '@' column selector: {trimmed:?}"
+            )));
+        }
+        return match item {
+            TableSpecifier::ColumnRange(start, end) => Ok(TableSpecifier::Combination(vec![
+                Box::new(TableSpecifier::SpecialItem(SpecialItem::ThisRow)),
+                Box::new(TableSpecifier::ColumnRange(start, end)),
+            ])),
+            other => Err(ParsingError::InvalidReference(format!(
+                "Unsupported selector after '@': {other}"
+            ))),
+        };
+    }
+    // Strip an optional surrounding `[ ... ]` to support `@[Col Name]`.
     let column = if let Some(stripped) = strip_outer_brackets(trimmed) {
         stripped
     } else {
@@ -572,6 +594,28 @@ fn strip_outer_brackets(s: &str) -> Option<String> {
         return None;
     }
     Some(inner.to_string())
+}
+
+/// Escape a column name for printing inside a structured reference: the
+/// inverse of [`unescape_name`]. `[`, `]`, `#` and `'` are prefixed with `'`.
+pub(crate) fn escape_column_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars() {
+        if matches!(c, '[' | ']' | '#' | '\'') {
+            out.push('\'');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Whether a column name can be printed bare inside a column range
+/// (`Table1[A:B]`) and still read back as the same range.
+pub(crate) fn is_simple_column_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| !matches!(c, '[' | ']' | '#' | '\'' | ':' | ',' | '@') && !c.is_whitespace())
 }
 
 /// Apply the OOXML `'X` per-character escape: a single apostrophe makes the

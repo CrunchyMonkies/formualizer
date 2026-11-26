@@ -216,6 +216,13 @@ impl<'a, R: EvaluationContext> FunctionProvider for DynamicRefCollector<'a, R> {
 }
 
 impl<'a, R: EvaluationContext> EvaluationContext for DynamicRefCollector<'a, R> {
+    fn resolve_this_row_reference(
+        &self,
+        table: &formualizer_parse::parser::TableReference,
+        cell: crate::reference::CellRef,
+    ) -> Option<Result<ReferenceType, ExcelError>> {
+        self.engine.resolve_this_row_reference(table, cell)
+    }
     fn operation_diagnostic_collector(
         &self,
     ) -> Option<&crate::operation_diagnostics::OperationDiagnosticCollector> {

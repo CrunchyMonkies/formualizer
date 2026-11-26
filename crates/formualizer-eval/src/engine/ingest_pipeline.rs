@@ -16,14 +16,14 @@ use crate::engine::shape_memo::{
     self, MemoValidity, ShapeLookup, ShapeMemo, Specialization, VisitTrace,
 };
 use crate::engine::sheet_registry::SheetRegistry;
+use crate::engine::structured_refs::StructuredRewrite;
 use crate::engine::vertex::VertexId;
 use crate::function::FnCaps;
 use crate::reference::{CellRef, Coord, RangeRef, SharedRangeRef, SharedRef, SharedSheetLocator};
 use crate::traits::FunctionProvider;
 use formualizer_common::{ExcelError, ExcelErrorKind, LiteralValue};
 use formualizer_parse::parser::{
-    ASTNode, ASTNodeType, CollectPolicy, ExternalRefKind, ReferenceType, SpecialItem,
-    TableSpecifier,
+    ASTNode, ASTNodeType, CollectPolicy, ExternalRefKind, ReferenceType,
 };
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -39,19 +39,28 @@ pub(crate) struct TableEntrySnapshot {
     pub(crate) range: RangeRef,
     pub(crate) header_row: bool,
     pub(crate) headers: Vec<String>,
+    pub(crate) totals_row: bool,
+    pub(crate) empty_body: bool,
     pub(crate) vertex: VertexId,
 }
 
-impl TableEntrySnapshot {
-    fn sheet_id(&self) -> SheetId {
-        self.range.start.sheet_id
+impl crate::engine::structured_refs::TableShape for TableEntrySnapshot {
+    fn table_name(&self) -> &str {
+        &self.name
     }
 
-    fn col_index(&self, header: &str) -> Option<usize> {
-        let header_key = header.to_lowercase();
-        self.headers
-            .iter()
-            .position(|h| h.to_lowercase() == header_key)
+    fn geometry(&self) -> crate::engine::structured_refs::TableGeometry<'_> {
+        crate::engine::structured_refs::TableGeometry {
+            sheet_id: self.range.start.sheet_id,
+            start_row: self.range.start.coord.row(),
+            start_col: self.range.start.coord.col(),
+            end_row: self.range.end.coord.row(),
+            end_col: self.range.end.coord.col(),
+            header_row: self.header_row,
+            totals_row: self.totals_row,
+            empty_body: self.empty_body,
+            headers: &self.headers,
+        }
     }
 }
 
@@ -580,9 +589,9 @@ impl<'a> IngestPipeline<'a> {
     ) -> Result<(IngestedFormula, Option<VisitTrace>), ExcelError> {
         let (ast_id, ast_for_oracles) = match ast {
             FormulaAstInput::Tree(mut tree) => {
-                self.rewrite_structured_references_for_cell(&mut tree, placement)?;
+                let lowered = self.bind_structured_references(&mut tree, placement)?;
                 let ast_id = self.data_store.store_ast(&tree, self.sheet_registry);
-                (ast_id, tree)
+                (ast_id, lowered.unwrap_or(tree))
             }
             FormulaAstInput::RawArena(id) => {
                 let needs_rewrite = self.data_store.ast_needs_structural_rewrite(id);
@@ -591,9 +600,9 @@ impl<'a> IngestPipeline<'a> {
                         .data_store
                         .retrieve_ast(id, self.sheet_registry)
                         .ok_or_else(missing_ast_error)?;
-                    self.rewrite_structured_references_for_cell(&mut tree, placement)?;
+                    let lowered = self.bind_structured_references(&mut tree, placement)?;
                     let rewritten_id = self.data_store.store_ast(&tree, self.sheet_registry);
-                    (rewritten_id, tree)
+                    (rewritten_id, lowered.unwrap_or(tree))
                 } else {
                     let tree = self
                         .data_store
@@ -875,6 +884,11 @@ impl<'a> IngestPipeline<'a> {
                     plan.resolved_named_refs.push(name.to_string());
                 } else if self.sources.resolve_scalar(name).is_some() {
                     plan.source_refs.push(name.to_string());
+                } else if self.tables.resolve(name).is_some() {
+                    // A bare table name is its data body (`SUM(Sales)`).
+                    plan.table_refs.push(name.to_string());
+                } else if self.sources.resolve_table(name).is_some() {
+                    plan.source_refs.push(name.to_string());
                 } else {
                     plan.named_refs.push(name.to_string());
                 }
@@ -924,42 +938,68 @@ impl<'a> IngestPipeline<'a> {
             .resolve_locator(&sheet, current_sheet_id)
     }
 
-    fn rewrite_structured_references_for_cell(
+    /// Bind structured references in `ast` to `cell`, returning the tree to
+    /// store and, when it holds qualified this-row references, the lowered
+    /// tree dependency planning reads instead.
+    fn bind_structured_references(
         &self,
         ast: &mut ASTNode,
         cell: CellRef,
-    ) -> Result<bool, ExcelError> {
-        self.rewrite_structured_references_node(ast, cell)
+    ) -> Result<Option<ASTNode>, ExcelError> {
+        self.rewrite_structured_references_node(ast, cell, false)?;
+        if !crate::engine::structured_refs::ast_has_named_this_row(ast) {
+            return Ok(None);
+        }
+        let mut lowered = ast.clone();
+        self.rewrite_structured_references_node(&mut lowered, cell, true)?;
+        Ok(Some(lowered))
     }
 
     fn rewrite_structured_references_node(
         &self,
         node: &mut ASTNode,
         cell: CellRef,
+        lower_named: bool,
     ) -> Result<bool, ExcelError> {
         match &mut node.node_type {
             ASTNodeType::Reference { reference, .. } => {
-                self.rewrite_structured_reference(reference, cell)
+                match crate::engine::structured_refs::rewrite_table_reference(
+                    reference,
+                    cell,
+                    lower_named,
+                    |name| self.tables.resolve(name),
+                    |cell| self.tables.find_containing_cell(cell),
+                )? {
+                    StructuredRewrite::Unchanged => Ok(false),
+                    StructuredRewrite::Rewritten => Ok(true),
+                    StructuredRewrite::Error(error) => {
+                        node.node_type = ASTNodeType::Literal(LiteralValue::Error(error));
+                        Ok(true)
+                    }
+                }
             }
             ASTNodeType::UnaryOp { expr, .. } => {
-                self.rewrite_structured_references_node(expr, cell)
+                self.rewrite_structured_references_node(expr, cell, lower_named)
             }
             ASTNodeType::BinaryOp { left, right, .. } => {
-                let left_rewritten = self.rewrite_structured_references_node(left, cell)?;
-                let right_rewritten = self.rewrite_structured_references_node(right, cell)?;
+                let left_rewritten =
+                    self.rewrite_structured_references_node(left, cell, lower_named)?;
+                let right_rewritten =
+                    self.rewrite_structured_references_node(right, cell, lower_named)?;
                 Ok(left_rewritten || right_rewritten)
             }
             ASTNodeType::Function { args, .. } => {
                 let mut rewritten = false;
                 for arg in args {
-                    rewritten |= self.rewrite_structured_references_node(arg, cell)?;
+                    rewritten |= self.rewrite_structured_references_node(arg, cell, lower_named)?;
                 }
                 Ok(rewritten)
             }
             ASTNodeType::Call { callee, args } => {
-                let mut rewritten = self.rewrite_structured_references_node(callee, cell)?;
+                let mut rewritten =
+                    self.rewrite_structured_references_node(callee, cell, lower_named)?;
                 for arg in args {
-                    rewritten |= self.rewrite_structured_references_node(arg, cell)?;
+                    rewritten |= self.rewrite_structured_references_node(arg, cell, lower_named)?;
                 }
                 Ok(rewritten)
             }
@@ -967,111 +1007,14 @@ impl<'a> IngestPipeline<'a> {
                 let mut rewritten = false;
                 for row in rows {
                     for item in row {
-                        rewritten |= self.rewrite_structured_references_node(item, cell)?;
+                        rewritten |=
+                            self.rewrite_structured_references_node(item, cell, lower_named)?;
                     }
                 }
                 Ok(rewritten)
             }
             ASTNodeType::Literal(_) | ASTNodeType::Omitted => Ok(false),
         }
-    }
-
-    fn rewrite_structured_reference(
-        &self,
-        reference: &mut ReferenceType,
-        cell: CellRef,
-    ) -> Result<bool, ExcelError> {
-        let ReferenceType::Table(tref) = reference else {
-            return Ok(false);
-        };
-        if !tref.name.is_empty() {
-            return Ok(false);
-        }
-
-        let col_name = match &tref.specifier {
-            Some(TableSpecifier::Combination(parts)) => {
-                let mut saw_this_row = false;
-                let mut col: Option<&str> = None;
-                for part in parts {
-                    match part.as_ref() {
-                        TableSpecifier::SpecialItem(SpecialItem::ThisRow) => saw_this_row = true,
-                        TableSpecifier::Column(c) => {
-                            if col.is_some() {
-                                return Err(ExcelError::new(ExcelErrorKind::NImpl).with_message(
-                                    "This-row structured reference with multiple columns is not supported".to_string(),
-                                ));
-                            }
-                            col = Some(c.as_str());
-                        }
-                        other => {
-                            return Err(ExcelError::new(ExcelErrorKind::NImpl).with_message(
-                                format!(
-                                    "Unsupported this-row structured reference component: {other}"
-                                ),
-                            ));
-                        }
-                    }
-                }
-                if !saw_this_row {
-                    return Err(ExcelError::new(ExcelErrorKind::NImpl).with_message(
-                        "Unnamed structured reference requires a this-row selector".to_string(),
-                    ));
-                }
-                col.ok_or_else(|| {
-                    ExcelError::new(ExcelErrorKind::NImpl).with_message(
-                        "This-row structured reference missing column selector".to_string(),
-                    )
-                })?
-            }
-            _ => {
-                return Err(ExcelError::new(ExcelErrorKind::NImpl).with_message(
-                    "Unnamed structured reference form is not supported".to_string(),
-                ));
-            }
-        };
-
-        let Some(table) = self.tables.find_containing_cell(cell) else {
-            return Err(ExcelError::new(ExcelErrorKind::Name)
-                .with_message("This-row structured reference used outside a table".to_string()));
-        };
-
-        let row0 = cell.coord.row();
-        let col0 = cell.coord.col();
-        let sr0 = table.range.start.coord.row();
-        let sc0 = table.range.start.coord.col();
-        let er0 = table.range.end.coord.row();
-        let ec0 = table.range.end.coord.col();
-
-        if table.sheet_id() != cell.sheet_id || row0 < sr0 || row0 > er0 || col0 < sc0 || col0 > ec0
-        {
-            return Err(ExcelError::new(ExcelErrorKind::Name)
-                .with_message("This-row structured reference used outside a table".to_string()));
-        }
-        if table.header_row && row0 == sr0 {
-            return Err(ExcelError::new(ExcelErrorKind::Ref).with_message(
-                "This-row structured references are not valid in the table header row".to_string(),
-            ));
-        }
-        let data_start = if table.header_row { sr0 + 1 } else { sr0 };
-        if row0 < data_start {
-            return Err(ExcelError::new(ExcelErrorKind::Ref).with_message(
-                "This-row structured references require a data/totals row context".to_string(),
-            ));
-        }
-
-        let Some(idx) = table.col_index(col_name) else {
-            return Err(ExcelError::new(ExcelErrorKind::Ref).with_message(format!(
-                "Unknown table column in this-row reference: {col_name}"
-            )));
-        };
-        *reference = ReferenceType::Cell {
-            sheet: None,
-            row: row0 + 1,
-            col: sc0 + idx as u32 + 1,
-            row_abs: true,
-            col_abs: true,
-        };
-        Ok(true)
     }
 }
 
@@ -2006,6 +1949,10 @@ mod tests {
                     if self.names.resolve(name, current_sheet_id).is_some() {
                         plan.resolved_named_refs.push(name.to_string());
                     } else if self.sources.resolve_scalar(name).is_some() {
+                        plan.source_refs.push(name.to_string());
+                    } else if self.tables.resolve(name).is_some() {
+                        plan.table_refs.push(name.to_string());
+                    } else if self.sources.resolve_table(name).is_some() {
                         plan.source_refs.push(name.to_string());
                     } else {
                         plan.named_refs.push(name.to_string());

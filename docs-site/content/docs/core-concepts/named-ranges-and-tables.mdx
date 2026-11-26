@@ -44,10 +44,8 @@ Loading an `.xlsx` file into a workbook (`load_workbook` in Python, `Workbook.fr
 ## Known limitations of in-memory tables
 Tables defined through the in-memory workbook APIs, or loaded from an `.xlsx` file as above, resolve structured references natively, without the XLSX recalc path above, and some forms are not yet handled correctly there:
 
-- Calculated-column and totals formulas that refer to their own table can be reported as circular references.
-- The named this-row form `Table1[[#This Row],[Qty]]` is not resolved; `[@Qty]` is.
+- Calculated-column and totals formulas that refer to a whole column or section of their own table, such as `=SUBTOTAL(109,Table1[Qty])` in the totals row, can be reported as circular references. This-row references (`[@Qty]`, `Table1[@Qty]`, `Table1[[#This Row],[Qty]]`) read only their own row and are not.
 - `INDEX` over a whole table or over `Table1[#Headers]` returns `#REF!`.
-- Selectors that combine a row specifier with columns, such as `Table1[[#Totals],[Qty]]`, are not implemented.
-- A bare table name such as `SUM(Table1)` is not resolved; write `Table1[#Data]`.
+- Inserting or deleting sheet rows does not move or resize a table.
 
 For these cases, use explicit A1 ranges in the in-memory APIs, or recalculate the saved file with `formualizer recalc`.

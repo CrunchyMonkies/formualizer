@@ -776,9 +776,10 @@ fn unsupported_specifiers_error_kind() {
     let ast = formualizer_parse::parser::parse("=SUM(Sales[@])").unwrap();
     engine.set_cell_formula("Sheet1", 1, 1, ast).unwrap();
 
+    // A source table has no sheet rows, so `#This Row` has no row to select.
     match engine.evaluate_cell("Sheet1", 1, 1).unwrap() {
-        Some(LiteralValue::Error(e)) => assert_eq!(e.kind, ExcelErrorKind::NImpl),
-        other => panic!("expected #N/IMPL!, got {other:?}"),
+        Some(LiteralValue::Error(e)) => assert_eq!(e.kind, ExcelErrorKind::Value),
+        other => panic!("expected #VALUE!, got {other:?}"),
     }
 }
 
