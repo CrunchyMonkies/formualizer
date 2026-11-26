@@ -880,6 +880,13 @@ impl<'a, R: EvaluationContext, S: ReadSink> EvaluationContext for RecordingConte
     fn formula_text_at_cell(&self, cell: CellRef) -> Result<Option<String>, ExcelError> {
         self.engine.formula_text_at_cell(cell)
     }
+    fn resolve_this_row_reference(
+        &self,
+        table: &formualizer_parse::parser::TableReference,
+        cell: CellRef,
+    ) -> Option<Result<ReferenceType, ExcelError>> {
+        self.engine.resolve_this_row_reference(table, cell)
+    }
     fn resolve_spill_reference(
         &self,
         anchor: &ReferenceType,

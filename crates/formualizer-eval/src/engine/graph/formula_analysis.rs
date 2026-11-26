@@ -236,6 +236,11 @@ fn collect_graph_reference(
                 context.named_dependencies.push(named_range.vertex);
             } else if let Some(source) = context.graph.resolve_source_scalar_entry(name) {
                 context.dependencies.insert(source.vertex);
+            } else if let Some(table) = context.graph.resolve_table_entry(name) {
+                // A bare table name is its data body (`SUM(Sales)`).
+                context.dependencies.insert(table.vertex);
+            } else if let Some(source) = context.graph.resolve_source_table_entry(name) {
+                context.dependencies.insert(source.vertex);
             } else {
                 match context.unresolved_name_policy {
                     UnresolvedNamePolicy::Error => {

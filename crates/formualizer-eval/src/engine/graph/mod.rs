@@ -6,10 +6,11 @@ use crate::engine::sheet_registry::SheetRegistry;
 #[cfg(test)]
 #[path = "malformed_spill_query_tests.rs"]
 mod malformed_spill_query_tests;
+use crate::engine::structured_refs::StructuredRewrite;
 use formualizer_common::{
     CoordBuildHasher, ExcelError, ExcelErrorKind, LiteralValue, PackedSheetCell,
 };
-use formualizer_parse::parser::{ASTNode, ASTNodeType, ReferenceType};
+use formualizer_parse::parser::{ASTNode, ASTNodeType};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 #[cfg(debug_assertions)]
@@ -2221,6 +2222,8 @@ impl DependencyGraph {
             range: entry.range,
             header_row: entry.header_row,
             headers: entry.headers.clone(),
+            totals_row: entry.totals_row,
+            empty_body: entry.empty_body,
             vertex: entry.vertex,
         };
         let tables_view = TableRegistryView::new(
@@ -3060,7 +3063,22 @@ impl DependencyGraph {
     ) -> Result<bool, ExcelError> {
         match &mut node.node_type {
             ASTNodeType::Reference { reference, .. } => {
-                self.rewrite_structured_reference(reference, cell)
+                match crate::engine::structured_refs::rewrite_table_reference(
+                    reference,
+                    cell,
+                    // This rewrite feeds dependency planning (the reference
+                    // ingest oracle), which reads lowered this-row references.
+                    true,
+                    |name| self.resolve_table_entry(name),
+                    |cell| self.find_table_containing_cell(cell),
+                )? {
+                    StructuredRewrite::Unchanged => Ok(false),
+                    StructuredRewrite::Rewritten => Ok(true),
+                    StructuredRewrite::Error(error) => {
+                        node.node_type = ASTNodeType::Literal(LiteralValue::Error(error));
+                        Ok(true)
+                    }
+                }
             }
             ASTNodeType::UnaryOp { expr, .. } => {
                 self.rewrite_structured_references_node(expr, cell)
@@ -3095,117 +3113,6 @@ impl DependencyGraph {
             }
             ASTNodeType::Literal(_) | ASTNodeType::Omitted => Ok(false),
         }
-    }
-
-    fn rewrite_structured_reference(
-        &self,
-        reference: &mut ReferenceType,
-        cell: CellRef,
-    ) -> Result<bool, ExcelError> {
-        use formualizer_parse::parser::{SpecialItem, TableSpecifier};
-
-        let ReferenceType::Table(tref) = reference else {
-            return Ok(false);
-        };
-
-        // This-row shorthand: parsed as an unnamed table reference with a Combination specifier.
-        if !tref.name.is_empty() {
-            return Ok(false);
-        }
-
-        let col_name = match &tref.specifier {
-            Some(TableSpecifier::Combination(parts)) => {
-                let mut saw_this_row = false;
-                let mut col: Option<&str> = None;
-                for p in parts {
-                    match p.as_ref() {
-                        TableSpecifier::SpecialItem(SpecialItem::ThisRow) => {
-                            saw_this_row = true;
-                        }
-                        TableSpecifier::Column(c) => {
-                            if col.is_some() {
-                                return Err(ExcelError::new(ExcelErrorKind::NImpl).with_message(
-                                    "This-row structured reference with multiple columns is not supported"
-                                        .to_string(),
-                                ));
-                            }
-                            col = Some(c.as_str());
-                        }
-                        other => {
-                            return Err(ExcelError::new(ExcelErrorKind::NImpl).with_message(
-                                format!(
-                                    "Unsupported this-row structured reference component: {other}"
-                                ),
-                            ));
-                        }
-                    }
-                }
-                if !saw_this_row {
-                    return Err(ExcelError::new(ExcelErrorKind::NImpl).with_message(
-                        "Unnamed structured reference requires a this-row selector".to_string(),
-                    ));
-                }
-                col.ok_or_else(|| {
-                    ExcelError::new(ExcelErrorKind::NImpl).with_message(
-                        "This-row structured reference missing column selector".to_string(),
-                    )
-                })?
-            }
-            _ => {
-                return Err(ExcelError::new(ExcelErrorKind::NImpl).with_message(
-                    "Unnamed structured reference form is not supported".to_string(),
-                ));
-            }
-        };
-
-        let Some(table) = self.find_table_containing_cell(cell) else {
-            return Err(ExcelError::new(ExcelErrorKind::Name)
-                .with_message("This-row structured reference used outside a table".to_string()));
-        };
-
-        let row0 = cell.coord.row();
-        let col0 = cell.coord.col();
-        let sr0 = table.range.start.coord.row();
-        let sc0 = table.range.start.coord.col();
-        let er0 = table.range.end.coord.row();
-        let ec0 = table.range.end.coord.col();
-
-        if row0 < sr0 || row0 > er0 || col0 < sc0 || col0 > ec0 {
-            return Err(ExcelError::new(ExcelErrorKind::Name)
-                .with_message("This-row structured reference used outside a table".to_string()));
-        }
-
-        if table.header_row && row0 == sr0 {
-            return Err(ExcelError::new(ExcelErrorKind::Ref).with_message(
-                "This-row structured references are not valid in the table header row".to_string(),
-            ));
-        }
-
-        let data_start = if table.header_row { sr0 + 1 } else { sr0 };
-        if row0 < data_start {
-            return Err(ExcelError::new(ExcelErrorKind::Ref).with_message(
-                "This-row structured references require a data/totals row context".to_string(),
-            ));
-        }
-
-        let Some(idx) = table.col_index(col_name) else {
-            return Err(ExcelError::new(ExcelErrorKind::Ref).with_message(format!(
-                "Unknown table column in this-row reference: {col_name}"
-            )));
-        };
-        let target_col0 = sc0 + (idx as u32);
-        let target_row = row0 + 1;
-        let target_col = target_col0 + 1;
-
-        *reference = ReferenceType::Cell {
-            sheet: None,
-            row: target_row,
-            col: target_col,
-            row_abs: true,
-            col_abs: true,
-        };
-
-        Ok(true)
     }
 
     fn find_table_containing_cell(&self, cell: CellRef) -> Option<&tables::TableEntry> {

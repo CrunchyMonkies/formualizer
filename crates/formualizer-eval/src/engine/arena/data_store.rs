@@ -399,8 +399,18 @@ impl DataStore {
             match node {
                 super::ast::AstNodeData::Reference { ref_type, .. } => {
                     let ref_type = self.compact_ref(*ref_type);
-                    if let CompactRefType::Table { name_id, .. } = ref_type
-                        && self.resolve_ast_string(*name_id).is_empty()
+                    // Unqualified references bind to the containing table and
+                    // this-row references to the formula's row at ingest.
+                    if let CompactRefType::Table {
+                        name_id,
+                        specifier_id,
+                    } = ref_type
+                        && (self.resolve_ast_string(*name_id).is_empty()
+                            || specifier_id
+                                .and_then(|id| self.asts.resolve_table_specifier(id))
+                                .is_some_and(
+                                    crate::engine::structured_refs::specifier_has_this_row,
+                                ))
                     {
                         return true;
                     }

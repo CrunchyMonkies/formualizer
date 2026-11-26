@@ -395,3 +395,177 @@ fn empty_table_rectangles_obstruct_spills_before_dependents_are_published() {
         }
     }
 }
+
+/// `Orders` at A1:C5 on Sheet1: header row 1, data rows 2..=4 (Qty = 2, 3, 4
+/// in A, Price = 10, 20, 30 in B), totals row 5. C2:C4 hold `formula`.
+fn calculated_column(formula: &str) -> Engine<crate::test_workbook::TestWorkbook> {
+    let mut engine = Engine::new(
+        crate::test_workbook::TestWorkbook::new(),
+        EvalConfig::default(),
+    );
+    engine.add_sheet("Sheet1").unwrap();
+    for row in 2..=4u32 {
+        engine
+            .set_cell_value("Sheet1", row, 1, LiteralValue::Number(f64::from(row)))
+            .unwrap();
+        engine
+            .set_cell_value(
+                "Sheet1",
+                row,
+                2,
+                LiteralValue::Number(f64::from(row - 1) * 10.0),
+            )
+            .unwrap();
+    }
+    let sheet = engine.sheet_id("Sheet1").unwrap();
+    engine
+        .define_table(
+            "Orders",
+            RangeRef::new(
+                CellRef::new(sheet, Coord::from_excel(1, 1, true, true)),
+                CellRef::new(sheet, Coord::from_excel(5, 3, true, true)),
+            ),
+            true,
+            vec!["Qty".into(), "Price".into(), "Total".into()],
+            true,
+        )
+        .unwrap();
+    for row in 2..=4 {
+        engine
+            .set_cell_formula(
+                "Sheet1",
+                row,
+                3,
+                formualizer_parse::parser::parse(formula).unwrap(),
+            )
+            .unwrap();
+    }
+    engine.evaluate_all().unwrap();
+    engine
+}
+
+fn column_c(
+    engine: &Engine<crate::test_workbook::TestWorkbook>,
+    rows: std::ops::RangeInclusive<u32>,
+) -> Vec<Option<LiteralValue>> {
+    rows.map(|r| engine.get_cell_value("Sheet1", r, 3))
+        .collect()
+}
+
+#[test]
+fn qualified_this_row_column_stays_symbolic_and_dirties_only_its_row() {
+    let n = |v: f64| Some(LiteralValue::Number(v));
+    for formula in [
+        "=Orders[[#This Row],[Qty]]*Orders[[#This Row],[Price]]",
+        "=Orders[@Qty]*Orders[@Price]",
+        "=PRODUCT(Orders[@[Qty]:[Price]])",
+    ] {
+        let mut engine = calculated_column(formula);
+        assert_eq!(
+            column_c(&engine, 2..=4),
+            vec![n(20.0), n(60.0), n(120.0)],
+            "{formula}"
+        );
+
+        // The stored formula keeps its structured reference.
+        let (ast, _) = engine.get_cell("Sheet1", 3, 3).unwrap();
+        let text = formualizer_parse::pretty::canonical_formula(&ast.unwrap());
+        assert!(text.contains("Orders["), "{formula} stored as {text}");
+
+        // Editing Qty in row 3 recomputes only C3.
+        engine
+            .set_cell_value("Sheet1", 3, 1, LiteralValue::Number(7.0))
+            .unwrap();
+        let result = engine.evaluate_all().unwrap();
+        assert_eq!(result.computed_vertices, 1, "{formula}");
+        assert_eq!(
+            column_c(&engine, 2..=4),
+            vec![n(20.0), n(140.0), n(120.0)],
+            "{formula}"
+        );
+    }
+}
+
+#[test]
+fn this_row_formula_moved_by_a_row_insert_reads_its_new_row() {
+    let n = |v: f64| Some(LiteralValue::Number(v));
+    let mut engine = calculated_column("=Orders[@Qty]*Orders[@Price]");
+    // Insert a sheet row before row 3: old row 3 (Qty 3, Price 20) moves to
+    // row 4. (Table extents do not follow row inserts yet; row 4 is a data
+    // row either way.)
+    engine.insert_rows("Sheet1", 3, 1).unwrap();
+    engine.evaluate_all().unwrap();
+    assert_eq!(engine.get_cell_value("Sheet1", 2, 3), n(20.0));
+    assert_eq!(engine.get_cell_value("Sheet1", 4, 3), n(60.0));
+    engine
+        .set_cell_value("Sheet1", 4, 2, LiteralValue::Number(1.0))
+        .unwrap();
+    engine.evaluate_all().unwrap();
+    assert_eq!(engine.get_cell_value("Sheet1", 4, 3), n(3.0));
+    assert_eq!(engine.get_cell_value("Sheet1", 2, 3), n(20.0));
+}
+
+#[test]
+fn bare_table_name_is_the_data_body_and_tracks_edits() {
+    let mut engine = calculated_column("=1");
+    for (col, formula) in [
+        (5, "=SUM(Orders)"),
+        (6, "=ROWS(Orders)"),
+        (7, "=COLUMNS(Orders)"),
+    ] {
+        engine
+            .set_cell_formula(
+                "Sheet1",
+                1,
+                col,
+                formualizer_parse::parser::parse(formula).unwrap(),
+            )
+            .unwrap();
+    }
+    engine.evaluate_all().unwrap();
+    // Qty 9 + Price 60 + Total 3 (three `=1` cells).
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 1, 5),
+        Some(LiteralValue::Number(72.0))
+    );
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 1, 6),
+        Some(LiteralValue::Number(3.0))
+    );
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 1, 7),
+        Some(LiteralValue::Number(3.0))
+    );
+    engine
+        .set_cell_value("Sheet1", 2, 1, LiteralValue::Number(102.0))
+        .unwrap();
+    engine.evaluate_all().unwrap();
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 1, 5),
+        Some(LiteralValue::Number(172.0))
+    );
+}
+
+#[test]
+fn this_row_outside_the_data_rows_evaluates_to_value_error() {
+    let mut engine = calculated_column("=1");
+    for (row, col) in [(1, 5), (5, 5), (5, 1), (9, 1)] {
+        engine
+            .set_cell_formula(
+                "Sheet1",
+                row,
+                col,
+                formualizer_parse::parser::parse("=Orders[@Qty]").unwrap(),
+            )
+            .unwrap();
+    }
+    engine.evaluate_all().unwrap();
+    for (row, col) in [(1, 5), (5, 5), (5, 1), (9, 1)] {
+        match engine.get_cell_value("Sheet1", row, col) {
+            Some(LiteralValue::Error(e)) => {
+                assert_eq!(e.kind, ExcelErrorKind::Value, "R{row}C{col}")
+            }
+            other => panic!("R{row}C{col}: {other:?}"),
+        }
+    }
+}

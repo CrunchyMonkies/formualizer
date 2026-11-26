@@ -1859,6 +1859,102 @@ pub trait Table: Debug + Send + Sync {
     }
     fn clone_box(&self) -> Box<dyn Table>;
 }
+/// Materialise the rows a structured-reference specifier selects from a
+/// [`Table`] that exposes only its sections and column names (for example a
+/// resolver- or source-provided table). Selection follows the same rules as
+/// engine tables; `#This Row` has no row context here and is `#VALUE!`.
+pub(crate) fn materialize_table_selection(
+    table: &dyn Table,
+    spec: &formualizer_parse::parser::TableSpecifier,
+) -> Result<Vec<Vec<LiteralValue>>, ExcelError> {
+    use crate::engine::structured_refs::{TableArea, TableGeometry, select_table_area};
+
+    let columns = table.columns();
+    let header_rows: Vec<Vec<LiteralValue>> = if table.has_headers() {
+        match table.headers_row() {
+            Some(row) => row.iter_rows().take(1).collect(),
+            None => vec![
+                columns
+                    .iter()
+                    .map(|c| LiteralValue::Text(c.clone()))
+                    .collect(),
+            ],
+        }
+    } else {
+        Vec::new()
+    };
+    let data_rows: Vec<Vec<LiteralValue>> = match table.data_body() {
+        Some(body) => body.iter_rows().collect(),
+        None => {
+            let height = table.data_height();
+            let mut rows = vec![vec![LiteralValue::Empty; columns.len()]; height];
+            for (ci, name) in columns.iter().enumerate() {
+                let col = table.get_column(name)?;
+                for (r, row) in rows.iter_mut().enumerate() {
+                    if let Some(slot) = row.get_mut(ci) {
+                        *slot = col.get(r, 0)?;
+                    }
+                }
+            }
+            rows
+        }
+    };
+    let totals_rows: Vec<Vec<LiteralValue>> = if table.has_totals() {
+        table
+            .totals_row()
+            .map(|row| row.iter_rows().take(1).collect())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    let header_row = !header_rows.is_empty();
+    let totals_row = !totals_rows.is_empty();
+    let empty_body = data_rows.is_empty();
+    let mut rows = header_rows;
+    rows.extend(data_rows);
+    rows.extend(totals_rows);
+    let (Some(last_row), Some(last_col)) =
+        (rows.len().checked_sub(1), columns.len().checked_sub(1))
+    else {
+        return Ok(Vec::new());
+    };
+    let to_u32 = |n: usize| {
+        u32::try_from(n).map_err(|_| {
+            ExcelError::new(ExcelErrorKind::Ref).with_message("Table too large".to_string())
+        })
+    };
+    let geometry = TableGeometry {
+        sheet_id: 0,
+        start_row: 0,
+        start_col: 0,
+        end_row: to_u32(last_row)?,
+        end_col: to_u32(last_col)?,
+        header_row,
+        totals_row,
+        empty_body,
+        headers: &columns,
+    };
+    match select_table_area(&geometry, spec, None)? {
+        TableArea::Empty => Ok(Vec::new()),
+        TableArea::Rect {
+            start_row,
+            start_col,
+            end_row,
+            end_col,
+        } => Ok(rows
+            .iter()
+            .skip(start_row as usize)
+            .take((end_row - start_row) as usize + 1)
+            .map(|row| {
+                (start_col as usize..=end_col as usize)
+                    .map(|c| row.get(c).cloned().unwrap_or(LiteralValue::Empty))
+                    .collect()
+            })
+            .collect()),
+    }
+}
+
 impl Table for Box<dyn Table> {
     fn get_cell(&self, r: usize, c: &str) -> Result<LiteralValue, ExcelError> {
         (**self).get_cell(r, c)
@@ -2041,11 +2137,16 @@ pub trait Resolver: ReferenceResolver + RangeResolver + NamedRangeResolver + Tab
                         }
                         Ok(Box::new(InMemoryRange::new(out)))
                     }
-                    Some(TableSpecifier::SpecialItem(
-                        formualizer_parse::parser::SpecialItem::ThisRow,
-                    )) => Err(ExcelError::new(ExcelErrorKind::NImpl).with_message(
-                        "@ (This Row) requires table-aware context; not yet supported".to_string(),
-                    )),
+                    Some(
+                        spec @ (TableSpecifier::SpecialItem(
+                            formualizer_parse::parser::SpecialItem::ThisRow,
+                        )
+                        | TableSpecifier::Combination(_)
+                        | TableSpecifier::Row(_)),
+                    ) => Ok(Box::new(InMemoryRange::new(materialize_table_selection(
+                        t.as_ref(),
+                        spec,
+                    )?))),
                     Some(TableSpecifier::All) => {
                         // Concatenate headers (if any), data, totals (if any)
                         let mut out: Vec<Vec<LiteralValue>> = Vec::new();
@@ -2067,13 +2168,6 @@ pub trait Resolver: ReferenceResolver + RangeResolver + NamedRangeResolver + Tab
                             Ok(Box::new(InMemoryRange::new(vec![])))
                         }
                     }
-                    // Defer complex combinations and row selectors for tranche 1
-                    Some(TableSpecifier::Combination(_)) => Err(ExcelError::new(
-                        ExcelErrorKind::NImpl,
-                    )
-                    .with_message("Complex structured references not yet supported".to_string())),
-                    Some(TableSpecifier::Row(_)) => Err(ExcelError::new(ExcelErrorKind::NImpl)
-                        .with_message("Row selectors (@/index) not yet supported".to_string())),
                     Some(TableSpecifier::Headers) | Some(TableSpecifier::Totals) => {
                         Err(ExcelError::new(ExcelErrorKind::NImpl).with_message(
                             "Legacy Headers/Totals variants not used; use SpecialItem".to_string(),
@@ -2312,6 +2406,19 @@ pub trait EvaluationContext: Resolver + FunctionProvider + SourceResolver {
     /// Retrieve formula text for a concrete cell, if that cell stores a formula.
     fn formula_text_at_cell(&self, _cell: CellRef) -> Result<Option<String>, ExcelError> {
         Ok(None)
+    }
+
+    /// Resolve a this-row structured reference (`Table1[@Qty]`,
+    /// `Table1[[#This Row],[Qty]]`) written in `cell` to the A1 reference it
+    /// denotes there, or the error it evaluates to (`#VALUE!` outside the
+    /// table's data rows). `None` when this context does not know the table.
+    #[doc(hidden)]
+    fn resolve_this_row_reference(
+        &self,
+        _table: &formualizer_parse::parser::TableReference,
+        _cell: CellRef,
+    ) -> Option<Result<ReferenceType, ExcelError>> {
+        None
     }
 
     /// Resolve a spill-range reference (`A1#`, `ANCHORARRAY(A1)`) to the

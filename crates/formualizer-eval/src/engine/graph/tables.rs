@@ -34,6 +34,26 @@ impl TableEntry {
     }
 }
 
+impl crate::engine::structured_refs::TableShape for TableEntry {
+    fn table_name(&self) -> &str {
+        &self.name
+    }
+
+    fn geometry(&self) -> crate::engine::structured_refs::TableGeometry<'_> {
+        crate::engine::structured_refs::TableGeometry {
+            sheet_id: self.sheet_id(),
+            start_row: self.range.start.coord.row(),
+            start_col: self.range.start.coord.col(),
+            end_row: self.range.end.coord.row(),
+            end_col: self.range.end.coord.col(),
+            header_row: self.header_row,
+            totals_row: self.totals_row,
+            empty_body: self.empty_body,
+            headers: &self.headers,
+        }
+    }
+}
+
 impl DependencyGraph {
     /// Empty table cells obstruct arrays just as populated table cells do.
     pub(crate) fn table_intersects_spill(

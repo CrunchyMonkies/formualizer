@@ -799,6 +799,18 @@ impl<'a> Interpreter<'a> {
         &self,
         reference: &'r ReferenceType,
     ) -> Result<Cow<'r, ReferenceType>, ExcelError> {
+        // A this-row structured reference (`Table1[@Qty]`) denotes cells in
+        // the formula cell's own row of the table.
+        if let ReferenceType::Table(table) = reference
+            && table
+                .specifier
+                .as_ref()
+                .is_some_and(crate::engine::structured_refs::specifier_has_this_row)
+            && let Some(cell) = self.current_cell
+            && let Some(lowered) = self.context.resolve_this_row_reference(table, cell)
+        {
+            return lowered.map(Cow::Owned);
+        }
         if self.reference_row_delta == 0 && self.reference_col_delta == 0 {
             return Ok(Cow::Borrowed(reference));
         }

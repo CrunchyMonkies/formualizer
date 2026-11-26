@@ -4834,15 +4834,11 @@ where
                 }
                 out
             }
-            Some(TableSpecifier::SpecialItem(SpecialItem::ThisRow)) => {
-                return Err(ExcelError::new(ExcelErrorKind::NImpl).with_message(
-                    "@ (This Row) requires table-aware context; not yet supported".to_string(),
-                ));
-            }
-            Some(TableSpecifier::Row(_)) | Some(TableSpecifier::Combination(_)) => {
-                return Err(ExcelError::new(ExcelErrorKind::NImpl)
-                    .with_message("Complex structured references not yet supported".to_string()));
-            }
+            Some(
+                spec @ (TableSpecifier::SpecialItem(SpecialItem::ThisRow)
+                | TableSpecifier::Row(_)
+                | TableSpecifier::Combination(_)),
+            ) => crate::traits::materialize_table_selection(table, spec)?,
             None => {
                 return Err(ExcelError::new(ExcelErrorKind::NImpl)
                     .with_message("Table reference without specifier is unsupported".to_string()));
@@ -20308,6 +20304,17 @@ where
             .is_some_and(|vertex| self.graph.is_live_formula_vertex(vertex)))
     }
 
+    fn resolve_this_row_reference(
+        &self,
+        table: &formualizer_parse::parser::TableReference,
+        cell: CellRef,
+    ) -> Option<Result<ReferenceType, ExcelError>> {
+        use crate::engine::structured_refs::{TableShape, lower_this_row_reference};
+        let entry = self.graph.resolve_table_entry(&table.name)?;
+        let spec = table.specifier.as_ref()?;
+        Some(lower_this_row_reference(&entry.geometry(), spec, cell))
+    }
+
     fn formula_text_at_cell(&self, cell: CellRef) -> Result<Option<String>, ExcelError> {
         let sheet_name = self.graph.sheet_name(cell.sheet_id);
         if sheet_name.is_empty() {
@@ -20693,6 +20700,19 @@ where
                     ));
                 }
 
+                // A bare table name is its data body (`SUM(Sales)`).
+                if self.graph.resolve_table_entry(name).is_some()
+                    || self.graph.resolve_source_table_entry(name).is_some()
+                {
+                    let table = ReferenceType::Table(formualizer_parse::parser::TableReference {
+                        name: name.clone(),
+                        specifier: Some(formualizer_parse::parser::TableSpecifier::SpecialItem(
+                            formualizer_parse::parser::SpecialItem::Data,
+                        )),
+                    });
+                    return self.resolve_range_view(&table, current_sheet);
+                }
+
                 let data = self.resolver.resolve_named_range_reference(name)?;
                 Ok(RangeView::from_owned_rows(data, self.config.date_system))
             }
@@ -20704,113 +20724,29 @@ where
                         .sheet(sheet_name)
                         .expect("Arrow sheet missing for table reference");
 
-                    let sr0 = table.range.start.coord.row() as usize;
-                    let sc0 = table.range.start.coord.col() as usize;
-                    let er0 = table.range.end.coord.row() as usize;
-                    let ec0 = table.range.end.coord.col() as usize;
-
-                    let has_totals = table.totals_row;
-                    let has_headers = table.header_row;
-                    let data_sr = if table.empty_body {
-                        er0.saturating_add(1)
-                    } else if has_headers {
-                        sr0.saturating_add(1)
-                    } else {
-                        sr0
+                    let Some(spec) = &tref.specifier else {
+                        return Err(ExcelError::new(ExcelErrorKind::NImpl).with_message(
+                            "Table reference without specifier is unsupported".to_string(),
+                        ));
                     };
-                    let data_er = if has_totals {
-                        er0.saturating_sub(1)
-                    } else {
-                        er0
+                    use crate::engine::structured_refs::{
+                        TableArea, TableShape, select_table_area,
                     };
-
-                    let select = |sr: usize, sc: usize, er: usize, ec: usize| {
-                        if sr > er || sc > ec {
-                            asheet.range_view(1, 1, 0, 0)
-                        } else {
-                            asheet.range_view(sr, sc, er, ec)
-                        }
-                    };
-
-                    let av = match &tref.specifier {
-                        None => {
-                            return Err(ExcelError::new(ExcelErrorKind::NImpl).with_message(
-                                "Table reference without specifier is unsupported".to_string(),
-                            ));
-                        }
-                        Some(formualizer_parse::parser::TableSpecifier::Column(col)) => {
-                            let Some(idx) = table.col_index(col) else {
-                                return Err(ExcelError::new(ExcelErrorKind::Ref).with_message(
-                                    "Column refers to unknown table column".to_string(),
-                                ));
-                            };
-                            let c0 = sc0 + idx;
-                            select(data_sr, c0, data_er, c0)
-                        }
-                        Some(formualizer_parse::parser::TableSpecifier::ColumnRange(
-                            start,
-                            end,
-                        )) => {
-                            let Some(si) = table.col_index(start) else {
-                                return Err(ExcelError::new(ExcelErrorKind::Ref).with_message(
-                                    "Column range refers to unknown column(s)".to_string(),
-                                ));
-                            };
-                            let Some(ei) = table.col_index(end) else {
-                                return Err(ExcelError::new(ExcelErrorKind::Ref).with_message(
-                                    "Column range refers to unknown column(s)".to_string(),
-                                ));
-                            };
-                            let (mut a, mut b) = (si, ei);
-                            if a > b {
-                                std::mem::swap(&mut a, &mut b);
-                            }
-                            let c_start = sc0 + a;
-                            let c_end = sc0 + b;
-                            select(data_sr, c_start, data_er, c_end)
-                        }
-                        Some(formualizer_parse::parser::TableSpecifier::All)
-                        | Some(formualizer_parse::parser::TableSpecifier::SpecialItem(
-                            formualizer_parse::parser::SpecialItem::All,
-                        )) => select(sr0, sc0, er0, ec0),
-                        Some(formualizer_parse::parser::TableSpecifier::Data)
-                        | Some(formualizer_parse::parser::TableSpecifier::SpecialItem(
-                            formualizer_parse::parser::SpecialItem::Data,
-                        )) => select(data_sr, sc0, data_er, ec0),
-                        Some(formualizer_parse::parser::TableSpecifier::Headers)
-                        | Some(formualizer_parse::parser::TableSpecifier::SpecialItem(
-                            formualizer_parse::parser::SpecialItem::Headers,
-                        )) => {
-                            if !has_headers {
-                                asheet.range_view(1, 1, 0, 0)
-                            } else {
-                                select(sr0, sc0, sr0, ec0)
-                            }
-                        }
-                        Some(formualizer_parse::parser::TableSpecifier::Totals)
-                        | Some(formualizer_parse::parser::TableSpecifier::SpecialItem(
-                            formualizer_parse::parser::SpecialItem::Totals,
-                        )) => {
-                            if !has_totals {
-                                asheet.range_view(1, 1, 0, 0)
-                            } else {
-                                select(er0, sc0, er0, ec0)
-                            }
-                        }
-                        Some(formualizer_parse::parser::TableSpecifier::SpecialItem(
-                            formualizer_parse::parser::SpecialItem::ThisRow,
-                        )) => {
-                            return Err(ExcelError::new(ExcelErrorKind::NImpl).with_message(
-                                "@ (This Row) requires table-aware context; not yet supported"
-                                    .to_string(),
-                            ));
-                        }
-                        Some(formualizer_parse::parser::TableSpecifier::Row(_))
-                        | Some(formualizer_parse::parser::TableSpecifier::Combination(_)) => {
-                            return Err(ExcelError::new(ExcelErrorKind::NImpl).with_message(
-                                "Complex structured references not yet supported".to_string(),
-                            ));
-                        }
+                    // This-row references are lowered to A1 references at
+                    // ingest; one that reaches evaluation has no row context.
+                    let av = match select_table_area(&table.geometry(), spec, None)? {
+                        TableArea::Rect {
+                            start_row,
+                            start_col,
+                            end_row,
+                            end_col,
+                        } => asheet.range_view(
+                            start_row as usize,
+                            start_col as usize,
+                            end_row as usize,
+                            end_col as usize,
+                        ),
+                        TableArea::Empty => asheet.range_view(1, 1, 0, 0),
                     };
 
                     return Ok(av);

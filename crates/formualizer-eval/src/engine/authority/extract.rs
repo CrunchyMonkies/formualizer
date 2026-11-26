@@ -308,11 +308,51 @@ fn collect(ctx: &mut Ctx<'_>, r: SemanticReference<'_>) -> Result<(), ExcelError
                             ctx.miss(lk.name.to_string());
                         }
                     }
+                    None if ctx.graph.resolve_table_entry(name).is_some()
+                        || ctx.graph.resolve_source_table_entry(name).is_some() =>
+                    {
+                        // A bare table name is its data body (`SUM(Sales)`).
+                        let table = formualizer_parse::parser::TableReference {
+                            name: name.to_string(),
+                            specifier: Some(
+                                formualizer_parse::parser::TableSpecifier::SpecialItem(
+                                    formualizer_parse::parser::SpecialItem::Data,
+                                ),
+                            ),
+                        };
+                        return collect(ctx, SemanticReference::Table(&table));
+                    }
                     None => {
                         ctx.flags |= F_OPAQUE;
                         ctx.miss(lk.name.to_string());
                     }
                 },
+            }
+        }
+        // A this-row reference (`Table1[@Qty]`) reads only the formula's own
+        // row of the table: the cells it lowers to there, as legacy plans it
+        // (not the whole table, which contains a calculated column).
+        SemanticReference::Table(t)
+            if ctx.symbol.is_none()
+                && t.specifier
+                    .as_ref()
+                    .is_some_and(crate::engine::structured_refs::specifier_has_this_row)
+                && ctx.graph.resolve_table_entry(&t.name).is_some() =>
+        {
+            use crate::engine::structured_refs::{TableShape, lower_this_row_reference};
+            let (Some(entry), Some(spec)) =
+                (ctx.graph.resolve_table_entry(&t.name), t.specifier.as_ref())
+            else {
+                return Ok(());
+            };
+            let cell = crate::reference::CellRef::new(
+                ctx.sheet,
+                crate::reference::Coord::new(ctx.row, ctx.col, true, true),
+            );
+            // Outside the data rows the reference is an error value and reads
+            // nothing.
+            if let Ok(lowered) = lower_this_row_reference(&entry.geometry(), spec, cell) {
+                return collect(ctx, refs::classify(&lowered));
             }
         }
         SemanticReference::Table(t) => match ctx.graph.resolve_table_entry(&t.name) {

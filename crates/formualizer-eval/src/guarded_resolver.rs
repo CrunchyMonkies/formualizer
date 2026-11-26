@@ -233,6 +233,19 @@ impl<R: EvaluationContext> FunctionProvider for GuardedResolver<R> {
 }
 
 impl<R: EvaluationContext> EvaluationContext for GuardedResolver<R> {
+    fn resolve_this_row_reference(
+        &self,
+        table: &formualizer_parse::parser::TableReference,
+        cell: CellRef,
+    ) -> Option<Result<ReferenceType, ExcelError>> {
+        let label = Label("resolve_this_row_reference", None);
+        external_callbacks::optional_callback(
+            &self.callbacks,
+            label,
+            || None,
+            || self.inner.resolve_this_row_reference(table, cell),
+        )
+    }
     fn operation_diagnostic_collector(
         &self,
     ) -> Option<&crate::operation_diagnostics::OperationDiagnosticCollector> {

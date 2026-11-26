@@ -49,6 +49,7 @@ pub mod scheduler;
 pub(crate) mod shape_memo;
 mod source_family;
 pub mod spill;
+pub(crate) mod structured_refs;
 mod target_preparation;
 #[doc(hidden)]
 pub mod template;

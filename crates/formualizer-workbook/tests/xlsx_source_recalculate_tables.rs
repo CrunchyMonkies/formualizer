@@ -558,14 +558,6 @@ fn this_row_body_placements_use_native_or_independent_oracles() {
             "Table1[@Qty]",
         ] {
             let formula = format!("{spelling}*10");
-            let expected = if spelling.starts_with('[') {
-                match native_value(&formula, "Sheet1", row, 2) {
-                    formualizer_common::LiteralValue::Number(n) => n.to_string(),
-                    other => panic!("{other:?}"),
-                }
-            } else {
-                ((row * 2 - 2) * 10).to_string()
-            };
             let p = two_column_fixture("0", 1, "D", false);
             let p = edit(
                 p,
@@ -577,9 +569,18 @@ fn this_row_body_placements_use_native_or_independent_oracles() {
                 &format!("<c r=\"B{row}\"><f>{formula}</f><v>99</v></c>"),
             );
             if row == 4 {
+                // Natively the totals row is #VALUE!, as in Excel.
                 unsupported(&pack(&p), &format!("{formula} in the totals row"));
                 continue;
             }
+            let expected = if spelling.starts_with('[') {
+                match native_value(&formula, "Sheet1", row, 2) {
+                    formualizer_common::LiteralValue::Number(n) => n.to_string(),
+                    other => panic!("{other:?}"),
+                }
+            } else {
+                ((row * 2 - 2) * 10).to_string()
+            };
             let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
             assert_eq!(
                 parse_sheet(&sheet_xml(&out.bytes))
