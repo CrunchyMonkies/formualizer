@@ -4,6 +4,10 @@ All notable changes to Formualizer will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- `Workbook::to_xlsx_bytes` now writes the workbook's defined names (workbook- and sheet-scoped, as `<definedNames>` with `localSheetId`) and tables (`xl/tables/tableN.xml` parts with header-row, totals-row and column metadata), so a saved `=SUM(Prices)` or `=SUM(Sales[Total])` reopens with its value instead of `#NAME?`. Each table is written under its engine name as both `name` and `displayName`, and table formulas stay ordinary cell formulas. Structured references are saved in Excel's stored form: `Sales[@Qty]` is written as `Sales[[#This Row],[Qty]]`.
+
 ## [0.15.0] - 2026-11-21
 
 Formualizer 0.15.0 is a **major performance release** alongside a broad wave of **Excel compatibility fixes**. Seven targeted engine and workbook optimizations wipe out quadratic bottlenecks that show up in real-world spreadsheets: full-column array formulas, rolling horizontal `COUNTIFS`/`SUMIFS` across financial-model periods, inserting or deleting rows in large models (and hitting undo/redo), thousands of `VLOOKUP`/`MATCH` lookups into large reference tables, whole-column `SUM(A:A)` summaries, iterative circular-reference models, and long interactive editing sessions.
