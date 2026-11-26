@@ -51,6 +51,8 @@ pub mod transaction;
 mod wasm_runtime_wasmtime;
 pub mod workbook;
 pub mod worksheet;
+#[cfg(feature = "umya")]
+mod xlsx_export;
 #[cfg(any(feature = "umya3", feature = "xlsx-recalc"))]
 pub(crate) mod xlsx_path;
 
