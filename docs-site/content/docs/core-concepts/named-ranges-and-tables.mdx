@@ -39,12 +39,15 @@ Structured table references (e.g., `Table1[Column]`, `Table1[@Column]`) are reco
 ## Tables in saved XLSX files
 [`formualizer recalc`](/docs/recalc-cli) recalculates Excel tables (ListObjects) in `.xlsx` files and leaves the table definitions untouched. It supports column and column-span references, `#Data`, `#All`, `#Headers`, `#Totals`, `[@Column]` / `[#This Row]` in the data body, and bare table names such as `SUM(Table1)`, which mean the data body. Calculated columns are recalculated from the formula stored in each row, so when you add rows with openpyxl, write the formula into every new row of the column before recalculating. Workbooks with table features outside the supported subset (for example connection-backed tables, computed `INDIRECT` text or defined names that refer to tables) are refused; see [Supported and refused](/docs/recalc-cli/supported-and-refused#excel-tables).
 
+Loading an `.xlsx` file into a workbook (`load_workbook` in Python, `Workbook.fromXlsxBytes` in JavaScript, or `Workbook::from_reader` in Rust, with the default native reader or Umya) registers its tables with the engine under their display names. Structured references then resolve as for tables defined through the in-memory APIs, with the limitations below. The native reader skips a table part it cannot read rather than refusing the workbook; references to that table stay `#NAME?`.
+
 ## Known limitations of in-memory tables
-Tables defined through the in-memory workbook APIs resolve structured references natively, without the XLSX recalc path above, and some forms are not yet handled correctly there:
+Tables defined through the in-memory workbook APIs, or loaded from an `.xlsx` file as above, resolve structured references natively, without the XLSX recalc path above, and some forms are not yet handled correctly there:
 
 - Calculated-column and totals formulas that refer to their own table can be reported as circular references.
 - The named this-row form `Table1[[#This Row],[Qty]]` is not resolved; `[@Qty]` is.
 - `INDEX` over a whole table or over `Table1[#Headers]` returns `#REF!`.
 - Selectors that combine a row specifier with columns, such as `Table1[[#Totals],[Qty]]`, are not implemented.
+- A bare table name such as `SUM(Table1)` is not resolved; write `Table1[#Data]`.
 
 For these cases, use explicit A1 ranges in the in-memory APIs, or recalculate the saved file with `formualizer recalc`.

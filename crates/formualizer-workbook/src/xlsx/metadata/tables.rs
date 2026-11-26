@@ -361,6 +361,76 @@ pub(in crate::xlsx) fn parse(
     Ok(t)
 }
 
+/// Extract the evaluation geometry of one ListObject for ordinary loading.
+///
+/// Unlike [`parse`], this neither proves calculation semantics nor refuses
+/// display, query or extension payloads: the ordinary loader only needs the
+/// name formulas use (`displayName`), the range, the header/totals flags and the
+/// column names. A part that does not yield those consistently is an error the
+/// caller treats as inert metadata, exactly as unadmitted dynamic metadata is.
+pub(in crate::xlsx) fn parse_read(
+    bytes: &[u8],
+    part: &str,
+    options: &crate::xlsx::options::ReadOptions,
+) -> Result<Table, IoError> {
+    let mut table: Option<Table> = None;
+    let mut column_lists = 0usize;
+    read_source(bytes, options, |path, node| {
+        if !matches!(node.kind, xml::Kind::Open { .. }) {
+            return Ok(());
+        }
+        let e = path.last().expect("open element");
+        if path.len() == 1 {
+            if e.local != "table" {
+                return Err(unsupported("table XML root", part));
+            }
+            let display = node
+                .value("displayName")
+                .or_else(|| node.value("name"))
+                .filter(|n| !n.is_empty())
+                .ok_or_else(|| unsupported("missing table name", part))?;
+            let rect = sheet::SourceRect::parse(node.required("ref")?)?;
+            let header = number(&node, "headerRowCount", Some(1))?;
+            let totals = number(&node, "totalsRowCount", Some(0))?;
+            if header > 1 || totals > 1 || header + totals > rect.last_row - rect.first_row + 1 {
+                return Err(unsupported("unsupported table header/totals layout", part));
+            }
+            if rect.last_col > options.limits.max_columns {
+                return Err(unsupported("table column limit", part));
+            }
+            table = Some(Table {
+                name: display.to_owned(),
+                rect,
+                header: header == 1,
+                totals: totals == 1,
+                active_filter: None,
+                columns: Vec::new(),
+            });
+        } else if path.len() == 2 && e.local == "tableColumns" {
+            column_lists += 1;
+        } else if path.len() == 3 && path[1].local == "tableColumns" && e.local == "tableColumn" {
+            let t = table
+                .as_mut()
+                .ok_or_else(|| unsupported("missing table root", part))?;
+            let width = (t.rect.last_col - t.rect.first_col + 1) as usize;
+            if t.columns.len() >= width {
+                return Err(unsupported("tableColumns width disagreement", part));
+            }
+            t.columns.push(Column {
+                name: node.required("name")?.to_owned(),
+                calculated: false,
+                total: false,
+            });
+        }
+        Ok(())
+    })?;
+    let t = table.ok_or_else(|| unsupported("missing table root", part))?;
+    if column_lists != 1 || t.columns.len() != (t.rect.last_col - t.rect.first_col + 1) as usize {
+        return Err(unsupported("tableColumns width disagreement", part));
+    }
+    Ok(t)
+}
+
 pub(in crate::xlsx) fn validate(
     table: &Table,
     cells: &[sheet::FormulaMark],
