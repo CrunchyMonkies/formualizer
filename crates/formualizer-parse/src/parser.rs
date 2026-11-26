@@ -302,8 +302,15 @@ impl Display for TableSpecifier {
             TableSpecifier::Headers => write!(f, "#Headers"),
             TableSpecifier::Totals => write!(f, "#Totals"),
             TableSpecifier::Row(row) => write!(f, "{row}"),
-            TableSpecifier::Column(column) => write!(f, "{column}"),
-            TableSpecifier::ColumnRange(start, end) => write!(f, "{start}:{end}"),
+            TableSpecifier::Column(column) => {
+                write!(f, "{}", structured_ref::escape_column_name(column))
+            }
+            TableSpecifier::ColumnRange(start, end) => write!(
+                f,
+                "{}:{}",
+                structured_ref::escape_column_name(start),
+                structured_ref::escape_column_name(end)
+            ),
             TableSpecifier::SpecialItem(item) => write!(f, "{item}"),
             TableSpecifier::Combination(specs) => {
                 // Emit nested bracketed parts so the surrounding Table formatter prints
@@ -319,7 +326,12 @@ impl Display for TableSpecifier {
                     first = false;
                     match spec.as_ref() {
                         TableSpecifier::ColumnRange(start, end) => {
-                            write!(f, "[{start}]:[{end}]")?;
+                            write!(
+                                f,
+                                "[{}]:[{}]",
+                                structured_ref::escape_column_name(start),
+                                structured_ref::escape_column_name(end)
+                            )?;
                         }
                         other => write!(f, "[{other}]")?,
                     }
@@ -1150,11 +1162,25 @@ impl Display for ReferenceType {
                         // For table references, we need to handle column specifiers specially
                         // to remove leading/trailing whitespace
                         match specifier {
-                            TableSpecifier::Column(column) => {
-                                format!("{}[{}]", table_ref.name, column.trim())
-                            }
+                            TableSpecifier::Column(column) => format!(
+                                "{}[{}]",
+                                table_ref.name,
+                                structured_ref::escape_column_name(column.trim())
+                            ),
                             TableSpecifier::ColumnRange(start, end) => {
-                                format!("{}[{}:{}]", table_ref.name, start.trim(), end.trim())
+                                let (start, end) = (start.trim(), end.trim());
+                                if structured_ref::is_simple_column_name(start)
+                                    && structured_ref::is_simple_column_name(end)
+                                {
+                                    format!("{}[{start}:{end}]", table_ref.name)
+                                } else {
+                                    format!(
+                                        "{}[[{}]:[{}]]",
+                                        table_ref.name,
+                                        structured_ref::escape_column_name(start),
+                                        structured_ref::escape_column_name(end)
+                                    )
+                                }
                             }
                             _ => {
                                 // For other specifiers, use the standard formatting

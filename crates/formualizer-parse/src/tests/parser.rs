@@ -2853,6 +2853,118 @@ mod structured_references {
         }
     }
 
+    fn this_row(col: TableSpecifier) -> Option<TableSpecifier> {
+        Some(TableSpecifier::Combination(vec![
+            Box::new(TableSpecifier::SpecialItem(SpecialItem::ThisRow)),
+            Box::new(col),
+        ]))
+    }
+
+    #[test]
+    fn calculated_column_spellings_parse_to_this_row_selectors() {
+        let qty = || TableSpecifier::Column("Qty".to_string());
+        for formula in [
+            "=Table1[[#This Row],[Qty]]",
+            "=Table1[@Qty]",
+            "=Table1[@[Qty]]",
+            "=Table1[[@],[Qty]]",
+        ] {
+            let t = expect_table(formula);
+            assert_eq!(t.name, "Table1", "{formula}");
+            assert_eq!(t.specifier, this_row(qty()), "{formula}");
+        }
+        let t = expect_table("=Table1[@[Unit Price]]");
+        assert_eq!(
+            t.specifier,
+            this_row(TableSpecifier::Column("Unit Price".to_string()))
+        );
+        let span = this_row(TableSpecifier::ColumnRange(
+            "Qty".to_string(),
+            "Unit Price".to_string(),
+        ));
+        for formula in [
+            "=Table1[@[Qty]:[Unit Price]]",
+            "=Table1[[#This Row],[Qty]:[Unit Price]]",
+            "=Table1[[@],[Qty]:[Unit Price]]",
+        ] {
+            assert_eq!(expect_table(formula).specifier, span, "{formula}");
+        }
+        let t = expect_table("=[@[Qty]:[Unit Price]]");
+        assert_eq!(t.name, "");
+        assert_eq!(t.specifier, span);
+        expect_parse_err("=Table1[@[Qty]:[Unit Price]x]");
+        expect_parse_err("=Table1[@[Qty],[Unit Price]]");
+    }
+
+    #[test]
+    fn section_and_column_combinations_parse() {
+        let total = || Box::new(TableSpecifier::Column("Total".to_string()));
+        let item = |s: SpecialItem| Box::new(TableSpecifier::SpecialItem(s));
+        assert_eq!(
+            expect_table("=Table1[[#Totals],[Total]]").specifier,
+            Some(TableSpecifier::Combination(vec![
+                item(SpecialItem::Totals),
+                total()
+            ]))
+        );
+        assert_eq!(
+            expect_table("=Table1[[#Headers],[#Data],[Total]]").specifier,
+            Some(TableSpecifier::Combination(vec![
+                item(SpecialItem::Headers),
+                item(SpecialItem::Data),
+                total()
+            ]))
+        );
+        assert_eq!(
+            expect_table("=Table1[[#Data],[#Totals],[Total]]").specifier,
+            Some(TableSpecifier::Combination(vec![
+                item(SpecialItem::Data),
+                item(SpecialItem::Totals),
+                total()
+            ]))
+        );
+    }
+
+    #[test]
+    fn escaped_column_names_parse_and_print_back_escaped() {
+        let t = expect_table("=Table1[Price '[AUD']]");
+        assert_eq!(
+            t.specifier,
+            Some(TableSpecifier::Column("Price [AUD]".to_string()))
+        );
+        let t = expect_table("=Table1[@[Price '[AUD']]]");
+        assert_eq!(
+            t.specifier,
+            this_row(TableSpecifier::Column("Price [AUD]".to_string()))
+        );
+        for formula in [
+            "=Table1[Price '[AUD']]",
+            "=Table1[@[Price '[AUD']]]",
+            "=Table1[[#Totals],[Price '[AUD']]]",
+            "=Table1[[Qty]:[Price '[AUD']]]",
+            "=Table1[[Qty]:[Unit Price]]",
+            "=Table1[@[Qty]:[Unit Price]]",
+            "=Table1[[#Totals],['#Count]]",
+            "=Table1[It''s]",
+        ] {
+            let parsed = expect_table(formula);
+            let printed = format!("={}", ReferenceType::Table(parsed.clone()));
+            assert_eq!(
+                expect_table(&printed),
+                parsed,
+                "{formula} printed as {printed} must read back the same"
+            );
+        }
+        assert_eq!(
+            ReferenceType::Table(expect_table("=Table1[Price '[AUD']]")).to_string(),
+            "Table1[Price '[AUD']]"
+        );
+        assert_eq!(
+            ReferenceType::Table(expect_table("=Table1[[Qty]:[Unit Price]]")).to_string(),
+            "Table1[[Qty]:[Unit Price]]"
+        );
+    }
+
     fn expect_parse_err(formula: &str) {
         let classic = parse_via_classic(formula);
         let span = parse_via_span(formula);
