@@ -276,6 +276,8 @@ pub struct NativeXlsxAdapter {
     loaded: HashSet<String>,
     stats: AdapterLoadStats,
     names: super::ingest::names::CalculationNames,
+    /// Worksheet ListObjects, by owning sheet, registered before formulas stage.
+    tables: Vec<(String, super::metadata::tables::Table)>,
     calc_settings: Option<crate::traits::CalcSettings>,
     name_diagnostics: Vec<crate::traits::NameImportDiagnostic>,
     sheet_diagnostics: Vec<crate::traits::SheetImportDiagnostic>,
@@ -361,6 +363,7 @@ impl NativeXlsxAdapter {
             styles,
             dynamic,
             names,
+            tables,
             calc_settings,
             has_links,
             sheet_diagnostics,
@@ -438,10 +441,14 @@ impl NativeXlsxAdapter {
                         }
                         Ok(())
                     })?;
+                    for sheet in declared.iter_mut().filter(|sheet| !sheet.inert) {
+                        sheet.tables = sheet_table_parts(archive, &sheet.part, &options)?;
+                    }
                     let mut needed: HashSet<_> = declared
                         .iter()
                         .filter(|s| !s.inert)
-                        .map(|s| s.part.clone())
+                        .flat_map(|s| std::iter::once(&s.part).chain(s.tables.values()))
+                        .cloned()
                         .collect();
                     for relation in relationships.values() {
                         if (relation.kind.ends_with("/sharedStrings")
@@ -467,6 +474,7 @@ impl NativeXlsxAdapter {
                     )?,
                 });
             }
+            let tables = read_tables(&mut archive, &declared, &options)?;
             // The baseline reports omitted modules first, then other inert
             // sheet kinds, retaining declaration order within each group.
             let sheet_diagnostics = declared
@@ -528,6 +536,7 @@ impl NativeXlsxAdapter {
                 styles,
                 dynamic,
                 names,
+                tables,
                 calc_settings,
                 has_links,
                 sheet_diagnostics,
@@ -546,6 +555,7 @@ impl NativeXlsxAdapter {
             loaded: HashSet::new(),
             stats: AdapterLoadStats::default(),
             names,
+            tables,
             calc_settings,
             name_diagnostics: Vec::new(),
             sheet_diagnostics,
@@ -557,6 +567,27 @@ impl NativeXlsxAdapter {
             package_ms,
             external_formulas_ms: 0.0,
         })
+    }
+    fn register_tables<R: EvaluationContext>(&self, engine: &mut Engine<R>) -> Result<(), IoError> {
+        use formualizer_eval::reference::{CellRef, Coord, RangeRef};
+        for (sheet, table) in &self.tables {
+            super::options::checkpoint(&self.options.cancel)?;
+            let Some(id) = engine.sheet_id(sheet) else {
+                continue;
+            };
+            let r = table.rect;
+            engine.define_table(
+                &table.name,
+                RangeRef::new(
+                    CellRef::new(id, Coord::from_excel(r.first_row, r.first_col, true, true)),
+                    CellRef::new(id, Coord::from_excel(r.last_row, r.last_col, true, true)),
+                ),
+                table.header,
+                table.columns.iter().map(|c| c.name.clone()).collect(),
+                table.totals,
+            )?;
+        }
+        Ok(())
     }
     fn finish_read<T>(&self, result: Result<T, IoError>) -> Result<T, IoError> {
         if result.as_ref().is_err_and(super::options::is_safety) {
@@ -837,6 +868,70 @@ impl NativeXlsxAdapter {
     }
 }
 use crate::legacy_formula::arrays::populated_coordinates;
+
+/// `rId -> part` for a worksheet's table relationships. Compatible loading
+/// treats an unreadable relationship part as declaring no tables, like other
+/// unadmitted metadata; only resource and cancellation failures escape.
+fn sheet_table_parts(
+    archive: &mut package::Archive<'_>,
+    part: &str,
+    options: &ReadOptions,
+) -> Result<BTreeMap<String, String>, IoError> {
+    let (parent, name) = part.rsplit_once('/').unwrap_or(("", part));
+    let rel_part = if parent.is_empty() {
+        format!("_rels/{name}.rels")
+    } else {
+        format!("{parent}/_rels/{name}.rels")
+    };
+    if !archive.file_names().any(|n| n == rel_part) {
+        return Ok(BTreeMap::new());
+    }
+    let relationships = match package::relationships_read(archive, part, options) {
+        Ok(relationships) => relationships,
+        Err(error) if super::options::is_safety(&error) => return Err(error),
+        Err(_) => return Ok(BTreeMap::new()),
+    };
+    Ok(relationships
+        .into_iter()
+        .filter(|(_, r)| r.kind.ends_with("/relationships/table"))
+        .filter_map(|(id, r)| Some((id, r.target?)))
+        .collect())
+}
+
+/// Parse each worksheet's table parts for engine registration. A missing,
+/// duplicate or malformed part, or a later table reusing a name, is skipped
+/// rather than refusing the workbook: its structured references then stay
+/// `#NAME?`, as before tables were read. Resource and cancellation failures
+/// still abort the load.
+fn read_tables(
+    archive: &mut package::Archive<'_>,
+    declared: &[package::Sheet],
+    options: &ReadOptions,
+) -> Result<Vec<(String, super::metadata::tables::Table)>, IoError> {
+    let mut tables = Vec::new();
+    let mut parts = HashSet::new();
+    let mut names = HashSet::new();
+    for sheet in declared.iter().filter(|sheet| !sheet.inert) {
+        for part in sheet.tables.values() {
+            super::options::checkpoint(&options.cancel)?;
+            if !parts.insert(part.as_str()) || !archive.file_names().any(|n| n == part) {
+                continue;
+            }
+            let parsed = package::take_part(archive, part, options.limits.max_worksheet_bytes)
+                .and_then(|bytes| super::metadata::tables::parse_read(&bytes, part, options));
+            match parsed {
+                Ok(table) => {
+                    if names.insert(table.name.to_lowercase()) {
+                        tables.push((sheet.name.clone(), table));
+                    }
+                }
+                Err(error) if super::options::is_safety(&error) => return Err(error),
+                Err(_) => {}
+            }
+        }
+    }
+    Ok(tables)
+}
 
 fn value_extent(coordinates: impl Iterator<Item = (u32, u32)>) -> (u32, u32) {
     let mut extent: Option<(u32, u32, u32, u32)> = None;
@@ -1167,6 +1262,9 @@ impl<R: EvaluationContext> EngineLoadStream<R> for NativeXlsxAdapter {
         self.budget.check()?;
         let names = self.sheet_names()?;
         engine.adopt_file_sheets(names.iter().map(String::as_str))?;
+        // Structured references bind by table name, possibly across sheets, so
+        // every table is known before any sheet's formulas are staged.
+        self.register_tables(engine)?;
         let previous = LoadConfig::begin(
             engine,
             self.external.is_some(),

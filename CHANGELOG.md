@@ -4,6 +4,10 @@ All notable changes to Formualizer will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Loading an `.xlsx` file with the default native reader now registers its worksheet tables with the engine, so structured references such as `SUM(Sales[Total])`, `Sales[#All]` and `Sales[#Headers]` evaluate instead of returning `#NAME?`. A table part the reader cannot read is skipped rather than refusing the workbook. (#571)
+
 ## [0.15.0] - 2026-11-21
 
 Formualizer 0.15.0 is a **major performance release** alongside a broad wave of **Excel compatibility fixes**. Seven targeted engine and workbook optimizations wipe out quadratic bottlenecks that show up in real-world spreadsheets: full-column array formulas, rolling horizontal `COUNTIFS`/`SUMIFS` across financial-model periods, inserting or deleting rows in large models (and hitting undo/redo), thousands of `VLOOKUP`/`MATCH` lookups into large reference tables, whole-column `SUM(A:A)` summaries, iterative circular-reference models, and long interactive editing sessions.
