@@ -1353,6 +1353,7 @@ impl Workbook {
         let mut adapter = UmyaAdapter::new_empty();
         adapter.set_date_system(self.engine.config.date_system);
         let sheet_names = self.sheet_names();
+        let mut dynamic_arrays = Vec::new();
 
         if let Some((first_sheet, remaining_sheets)) = sheet_names.split_first() {
             if first_sheet != "Sheet1" {
@@ -1380,6 +1381,13 @@ impl Workbook {
                         if value.is_none() && formula.is_none() {
                             continue;
                         }
+                        if formula.is_some()
+                            && let Some(anchor) =
+                                self.dynamic_array_anchor(sheet_name, row, col, value.as_ref())
+                        {
+                            dynamic_arrays.push(anchor);
+                        }
+                        let formula = formula.map(|f| crate::xlsx_export::storage_formula(&f));
 
                         adapter
                             .write_cell(
@@ -1401,6 +1409,11 @@ impl Workbook {
         let bytes = adapter
             .save_to_bytes()
             .map_err(|e| IoError::from_backend("umya", e))?;
+        // Umya cannot write array references or cell metadata: mark the
+        // dynamic-array anchors as Excel does so their saved spill children
+        // reload as spill output instead of blocking the spill.
+        let bytes = crate::xlsx_export::write_dynamic_arrays(&bytes, &dynamic_arrays)
+            .map_err(|e| IoError::from_backend("umya", e))?;
 
         // Spec §9 save mapping: rewrite `xl/workbook.xml`'s `<calcPr>` to reflect
         // the active cycle config's iterate settings. umya hard-codes
@@ -1416,6 +1429,62 @@ impl Workbook {
         let bytes = crate::calc_pr::rewrite_calc_pr_in_zip(&bytes, &settings)
             .map_err(|e| IoError::from_backend("umya", e))?;
         Ok(bytes)
+    }
+
+    /// The dynamic-array anchor stored for a formula cell, if any: a current
+    /// spill whose every member this anchor owns (`ref` = the extent), or a
+    /// blocked spill (`ref` = the anchor cell, as Excel writes `#SPILL!`).
+    /// Anything else is an ordinary formula.
+    #[cfg(feature = "umya")]
+    fn dynamic_array_anchor(
+        &self,
+        sheet: &str,
+        row: u32,
+        col: u32,
+        value: Option<&LiteralValue>,
+    ) -> Option<crate::xlsx_export::DynamicArrayAnchor> {
+        use formualizer_common::CellAddress;
+        use formualizer_eval::engine::inspect::SpillRole;
+        let anchor = |last_row, last_col| crate::xlsx_export::DynamicArrayAnchor {
+            sheet: sheet.to_string(),
+            row,
+            col,
+            last_row,
+            last_col,
+        };
+        let address = CellAddress::new(sheet, row, col).ok()?;
+        let result = self.engine.inspect_cell_result(&address).ok()?;
+        match result.spill {
+            Some(SpillRole::Anchor { extent })
+                if extent.sheet == sheet && (extent.start_row, extent.start_col) == (row, col) =>
+            {
+                let owned = (extent.start_row..=extent.end_row).all(|r| {
+                    (extent.start_col..=extent.end_col).all(|c| {
+                        (r, c) == (row, col)
+                            || CellAddress::new(sheet, r, c)
+                                .ok()
+                                .and_then(|member| self.engine.inspect_cell_result(&member).ok())
+                                .is_some_and(|m| {
+                                    matches!(m.spill, Some(SpillRole::Member { anchor })
+                                        if anchor == address)
+                                })
+                    })
+                });
+                if owned {
+                    Some(anchor(extent.end_row, extent.end_col))
+                } else {
+                    // Never claim a cell the spill does not own: a user value
+                    // inside the extent would reload as generated output.
+                    None
+                }
+            }
+            _ if matches!(value, Some(LiteralValue::Error(e))
+                if e.kind == formualizer_common::ExcelErrorKind::Spill) =>
+            {
+                Some(anchor(row, col))
+            }
+            _ => None,
+        }
     }
 
     pub fn register_custom_function(
