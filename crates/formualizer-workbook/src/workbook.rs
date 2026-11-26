@@ -1414,6 +1414,15 @@ impl Workbook {
         // reload as spill output instead of blocking the spill.
         let bytes = crate::xlsx_export::write_dynamic_arrays(&bytes, &dynamic_arrays)
             .map_err(|e| IoError::from_backend("umya", e))?;
+        // Umya's name and table writers cannot express sheet scope reliably,
+        // header-less tables or a totals-row-aware filter: add the engine's
+        // defined names and tables to the package directly.
+        let bytes = crate::xlsx_export::write_names_and_tables(
+            &bytes,
+            &self.defined_names_for_export(&sheet_names),
+            &self.tables_for_export(),
+        )
+        .map_err(|e| IoError::from_backend("umya", e))?;
 
         // Spec §9 save mapping: rewrite `xl/workbook.xml`'s `<calcPr>` to reflect
         // the active cycle config's iterate settings. umya hard-codes
@@ -1429,6 +1438,109 @@ impl Workbook {
         let bytes = crate::calc_pr::rewrite_calc_pr_in_zip(&bytes, &settings)
             .map_err(|e| IoError::from_backend("umya", e))?;
         Ok(bytes)
+    }
+
+    /// The engine's defined names as written to `xl/workbook.xml`, in
+    /// snapshot order (workbook scope first, then by sheet and name). Names
+    /// whose definition has no formula text (a cross-sheet range, an array or
+    /// date literal) or whose scope sheet is gone are skipped.
+    #[cfg(feature = "umya")]
+    fn defined_names_for_export(
+        &self,
+        sheet_names: &[String],
+    ) -> Vec<crate::xlsx_export::DefinedNameExport> {
+        self.engine
+            .named_ranges_snapshot()
+            .into_iter()
+            .filter_map(|named| {
+                let local_sheet = match named.scope {
+                    NameScope::Workbook => None,
+                    NameScope::Sheet(id) => {
+                        let sheet = self.engine.sheet_name(id);
+                        Some(sheet_names.iter().position(|s| s == sheet)?)
+                    }
+                };
+                let formula = self.defined_name_formula(&named.definition)?;
+                Some(crate::xlsx_export::DefinedNameExport {
+                    name: named.name,
+                    local_sheet,
+                    formula,
+                })
+            })
+            .collect()
+    }
+
+    /// The stored (`=`-less, `_xlfn.`-prefixed) formula text of a name.
+    #[cfg(feature = "umya")]
+    fn defined_name_formula(&self, definition: &NamedDefinition) -> Option<String> {
+        use formualizer_parse::parser::ReferenceType;
+        let reference = |start: &formualizer_eval::reference::CellRef,
+                         end: &formualizer_eval::reference::CellRef| {
+            if start.sheet_id != end.sheet_id {
+                return None;
+            }
+            let sheet = Some(self.engine.sheet_name(start.sheet_id).to_string());
+            let (s, e) = (start.coord, end.coord);
+            let reference = if s == e {
+                ReferenceType::Cell {
+                    sheet,
+                    row: s.row() + 1,
+                    col: s.col() + 1,
+                    row_abs: s.row_abs(),
+                    col_abs: s.col_abs(),
+                }
+            } else {
+                // Whole columns were bounded at load; `$A$1:$A$1048576` is
+                // the same range to Excel.
+                ReferenceType::Range {
+                    sheet,
+                    start_row: Some(s.row() + 1),
+                    start_col: Some(s.col() + 1),
+                    end_row: Some(e.row() + 1),
+                    end_col: Some(e.col() + 1),
+                    start_row_abs: s.row_abs(),
+                    start_col_abs: s.col_abs(),
+                    end_row_abs: e.row_abs(),
+                    end_col_abs: e.col_abs(),
+                }
+            };
+            Some(reference.to_excel_string())
+        };
+        match definition {
+            NamedDefinition::Cell(cell) => reference(cell, cell),
+            NamedDefinition::Range(range) => reference(&range.start, &range.end),
+            NamedDefinition::Literal(value) => match value {
+                LiteralValue::Int(i) => Some(i.to_string()),
+                LiteralValue::Number(n) if n.is_finite() => Some(n.to_string()),
+                LiteralValue::Text(s) => Some(format!("\"{}\"", s.replace('"', "\"\""))),
+                LiteralValue::Boolean(b) => Some(if *b { "TRUE" } else { "FALSE" }.to_string()),
+                LiteralValue::Error(e) => Some(e.kind.to_string()),
+                _ => None,
+            },
+            NamedDefinition::Formula { ast, .. } => Some(crate::xlsx_export::storage_formula(
+                &formualizer_parse::pretty::pretty_print(ast),
+            )),
+        }
+    }
+
+    /// The engine's tables as written to `xl/tables/tableN.xml`. The engine
+    /// keeps one name per table, written as both `name` and `displayName`.
+    #[cfg(feature = "umya")]
+    fn tables_for_export(&self) -> Vec<crate::xlsx_export::TableExport> {
+        self.tables()
+            .into_iter()
+            .map(|table| crate::xlsx_export::TableExport {
+                sheet: table.sheet,
+                name: table.name,
+                first_row: table.start_row,
+                first_col: table.start_col,
+                last_row: table.end_row,
+                last_col: table.end_col,
+                header_row: table.header_row,
+                totals_row: table.totals_row,
+                headers: table.headers,
+            })
+            .collect()
     }
 
     /// The dynamic-array anchor stored for a formula cell, if any: a current
